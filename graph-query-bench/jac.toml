@@ -1,0 +1,22 @@
+[project]
+name = "graph-query-bench"
+version = "1.0.0"
+description = "Benchmark: local walker traversal vs SQLite topology index (GT path)"
+entry-point = "main.jac"
+
+[serve]
+base_route_app = "app"
+
+[plugins.client]
+
+[plugins.scale]
+
+[dependencies]
+watchdog = "~=6.0"
+
+[dependencies.npm]
+react-router-dom = "latest"
+react-error-boundary = "latest"
+
+[dependencies.npm.dev]
+"@jac-client/dev-deps" = "1.0.0"
