@@ -375,7 +375,7 @@ walker:pub run_all_scenarios {
     can run_all with Root entry {
         import os;
         ctx         = JacRuntimeInterface.get_context();
-        fan_outs    = [5, 50, 200, 500];
+        fan_outs    = [5, 50, 200, 500, 1000];
         selectivities = [0.1, 0.25, 0.5, 0.75, 0.9];
         all_results: list = [];
         heatmap:     dict = {};
@@ -890,6 +890,7 @@ cl {
                                             <option value={50}>50 nodes</option>
                                             <option value={200}>200 nodes</option>
                                             <option value={500}>500 nodes</option>
+                                            <option value={1000}>1000 nodes</option>
                                         </select>
                                     </div>
                                     <div>
@@ -977,7 +978,7 @@ cl {
                                                     <th style={{"padding": "8px 14px", "background": "#f8fafc", "border": "1px solid #e2e8f0", "fontWeight": "700"}}>Selectivity</th>
                                                     {[
                                                         <th key={fo} style={{"padding": "8px 14px", "background": "#f8fafc", "border": "1px solid #e2e8f0", "fontWeight": "700", "textAlign": "center"}}>{f"fan={fo}"}</th>
-                                                        for fo in [5, 50, 200, 500]
+                                                        for fo in [5, 50, 200, 500, 1000]
                                                     ]}
                                                 </tr>
                                             </thead>
@@ -1002,7 +1003,7 @@ cl {
                                                                     else <span style={{"color": "#94a3b8"}}>—</span>
                                                                 )}
                                                             </td>
-                                                            for fo in [5, 50, 200, 500]
+                                                            for fo in [5, 50, 200, 500, 1000]
                                                         ]}
                                                     </tr>
                                                     for sel_pct in [10, 25, 50, 75, 90]
@@ -1039,6 +1040,7 @@ cl {
                                             <option value={50}>50 nodes</option>
                                             <option value={200}>200 nodes</option>
                                             <option value={500}>500 nodes</option>
+                                            <option value={1000}>1000 nodes</option>
                                         </select>
                                     </div>
                                     <div>
