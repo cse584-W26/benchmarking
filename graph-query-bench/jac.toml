@@ -1,7 +1,7 @@
 [project]
 name = "graph-query-bench"
 version = "1.0.0"
-description = "Benchmark: local walker traversal vs SQLite topology index (GT path)"
+description = "Direct runtime benchmark: JAC_INDEX_ENABLED OFF vs ON cold vs ON warm"
 entry-point = "main.jac"
 
 [serve]
@@ -11,8 +11,6 @@ base_route_app = "app"
 
 [plugins.scale]
 
-[dependencies]
-watchdog = "~=6.0"
 
 [dependencies.npm]
 react-router-dom = "latest"

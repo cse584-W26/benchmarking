@@ -1,761 +1,491 @@
 """
 Graph Query Benchmark
 =====================
-Compares three query strategies for filtered walker traversals in Jaseci:
+Directly benchmarks the AM/GT topology index optimization in the Jaseci runtime
+by toggling JAC_INDEX_ENABLED between runs on the same graph.
 
-  Local path: [here-->](?:TargetNode)
-    Loads ALL connected nodes from SQLite, filters by type in memory.
+No simulation — uses the real runtime (SqliteMemory topology tables + am_index).
 
-  GT path (simulated topology index):
-    Looks up matching node IDs from a JSON sidecar index keyed by source node ID,
-    then fetches only those nodes through the memory hierarchy.
+Three paths measured per scenario:
+  OFF      JAC_INDEX_ENABLED=false  edge-list loop, load ALL neighbors, filter in memory
+  ON cold  JAC_INDEX_ENABLED=true   first traversal after AM eviction: AM miss → GT → warms AM
+  ON warm  JAC_INDEX_ENABLED=true   subsequent traversals: AM hit → bulk fetch only
 
-  AM path (in-memory source-type adjacency matrix):
-    Pure in-memory dict: { source_id: { node_type: [target_ids] } }
-    O(1) dict lookup, no file I/O, volatile (lost on restart).
-    Then fetches only matching nodes from SQLite.
+Scenarios:
+  1. Single-hop     root –BenchRoot→ [TargetNode | OtherNode],  query (?:TargetNode)
+  2. Inheritance    root –BenchRoot→ [PostNode | CommentNode | OtherNode], query (?:BaseContent)
+  3. Multi-hop      root –BenchRoot→ MidNode → [TargetNode | OtherNode],  2-hop query
 
-Scenarios covered:
-  1. Single-hop      root --> [TargetNode | OtherNode]
-  2. Inheritance     root --> [PostNode | CommentNode | OtherNode]
-                     query (?:BaseContent) returns PostNode + CommentNode via MRO
-  3. Multi-hop       root --> MidNode --> [TargetNode | OtherNode]  (2-hop)
-  4. Arbitrary start traverse from a non-root MidNode, not from root
+Each walker creates an isolated BenchRoot container, benchmarks, then deletes it,
+so repeated runs do not accumulate stale graph state on root.
 
-GT index format (JSON, keyed by source node UUID string):
-  { "src_uuid": { "TypeName": ["uuid", ...] } }
-  Same structure as am_index — supports all four scenarios uniformly.
-
-Run with:
-  cd benchmarks/graph-query-bench
+Run:
+  cd benchmarking/graph-query-bench
   jac install
   jac start main.jac --dev
 """
 
-import from os.path { join, exists }
-import from os { makedirs, getcwd }
+import os;
 import from time { perf_counter }
-import from uuid { UUID }
-import from json { dumps, loads }
 import from jaclang.jac0core.runtime { JacRuntimeInterface }
-import from am_store { am_index, get_type_mro }
+import from jaclang.runtimelib.am_index {
+    am_clear,
+    am_invalidate,
+    reset_stats,
+    _stats
+}
 
 # ============================================================================
 # GRAPH NODES
 # ============================================================================
 
-# Single-hop benchmark
-node TargetNode { has node_id: int; }
-node OtherNode  { has node_id: int; }
+# Container for isolated benchmark subgraphs — never queried, just a root scope.
+node BenchRoot {}
 
-# Inheritance benchmark
-# get_type_mro(PostNode())    → ["PostNode", "BaseContent"]
-# get_type_mro(CommentNode()) → ["CommentNode", "BaseContent"]
-# Index fan-out at write time: both stored under "BaseContent" bucket.
-# Query (?:BaseContent) hits that bucket → returns PostNode + CommentNode.
-node BaseContent             { has node_id: int; }
-node PostNode(BaseContent)   { has node_id: int; }
-node CommentNode(BaseContent){ has node_id: int; }
+# Single-hop & multi-hop
+node TargetNode { has val: int = 0; }
+node OtherNode  { has val: int = 0; }
 
-# Multi-hop / arbitrary-start benchmark
-node MidNode { has node_id: int; }
+# Inheritance: PostNode and CommentNode both inherit BaseContent.
+# am_put fans out to ["PostNode","BaseContent"] and ["CommentNode","BaseContent"]
+# so [bench-->(?:BaseContent)] resolves both subtypes via a single AM/GT lookup.
+node BaseContent             { has val: int = 0; }
+node PostNode(BaseContent)   { has val: int = 0; }
+node CommentNode(BaseContent){ has val: int = 0; }
+
+# Multi-hop intermediate layer
+node MidNode { has val: int = 0; }
 
 # ============================================================================
-# TOPOLOGY INDEX HELPERS
-# GT index: { "src_uuid_str": { "TypeName": ["uuid_str", ...] } }
-# Keyed by source node ID so a single file serves all four scenarios.
+# SHARED HELPERS (inline, no import from am_store)
 # ============================================================================
 
-def topo_path -> str {
-    p = join(getcwd(), ".jac", "data");
-    makedirs(p, exist_ok=True);
-    return join(p, "bench_topo_index.json");
+def _avg(times: list) -> float {
+    return sum(times) / len(times) if times else 0.0;
 }
 
-def load_topo -> dict {
-    path = topo_path();
-    if exists(path) {
-        f = open(path, "r");
-        data = loads(f.read());
-        f.close();
-        return data;
-    }
-    return {};
-}
-
-def save_topo(index: dict) -> None {
-    f = open(topo_path(), "w");
-    f.write(dumps(index));
-    f.close();
+def _speedup(baseline: float, fast: float) -> float {
+    return round(baseline / fast, 1) if fast > 0 else 0.0;
 }
 
 # ============================================================================
 # SCENARIO 1 — SINGLE-HOP
-# seed_graph  : root -> [TargetNode, OtherNode]
-# run_benchmark: [here-->(?:TargetNode)]
+# Graph:  BenchRoot → [TargetNode × n_targets | OtherNode × n_others]
+# OFF:    edge-list loop, loads all n_targets+n_others, filters by type
+# ON:     index resolves TargetNode IDs → bulk-fetch only n_targets
 # ============================================================================
 
-walker:pub seed_graph {
-    has fan_out: int = 50,
-        selectivity: float = 0.5;
-
-    can seed with Root entry {
-        target_count = int(self.fan_out * self.selectivity);
-        source_key = str(here.__jac__.id);
-        gt_full = load_topo();
-        gt_full[source_key] = {};
-        am_index[source_key] = {};
-
-        for i in range(self.fan_out) {
-            if i < target_count {
-                n = (here ++> TargetNode(node_id=i))[0];
-            } else {
-                n = (here ++> OtherNode(node_id=i))[0];
-            }
-            tid = str(n.__jac__.id);
-            for type_name in get_type_mro(n) {
-                if type_name not in gt_full[source_key] { gt_full[source_key][type_name] = []; }
-                gt_full[source_key][type_name].append(tid);
-                if type_name not in am_index[source_key] { am_index[source_key][type_name] = []; }
-                am_index[source_key][type_name].append(tid);
-            }
-        }
-        save_topo(gt_full);
-        report {
-            "status": "seeded",
-            "fan_out": self.fan_out,
-            "selectivity": self.selectivity,
-            "target_nodes": target_count,
-            "other_nodes": self.fan_out - target_count
-        };
-    }
-}
-
-walker:pub run_benchmark {
-    has fan_out: int = 50,
-        selectivity: float = 0.5,
+walker:pub bench_single_hop {
+    has n_targets: int = 5,
+        n_others:  int = 45,
         iterations: int = 5;
 
-    can bench with Root entry {
-        if not [here-->(?:TargetNode)] and not [here-->(?:OtherNode)] {
-            report {"error": "Graph not seeded. Run seed_graph first."};
-            disengage;
-        }
+    can run with Root entry {
+        import os;
+
+        # ---- Build isolated subgraph ----
+        bench = (here ++> BenchRoot())[0];
+        for i in range(self.n_targets) { bench ++> TargetNode(val=i); }
+        for i in range(self.n_others)  { bench ++> OtherNode(val=i); }
+
         ctx = JacRuntimeInterface.get_context();
-        source_key = str(here.__jac__.id);
-        gt_full = load_topo();
-        target_ids    = gt_full.get(source_key, {}).get("TargetNode", []);
-        am_target_ids = am_index.get(source_key, {}).get("TargetNode", []);
+        fan_out = self.n_targets + self.n_others;
+        sel     = self.n_targets / fan_out if fan_out > 0 else 0.0;
 
-        local_times: list = [];
-        gt_times: list = [];
-        am_times: list = [];
-
+        # ---- OFF path: index disabled ----
+        os.environ["JAC_INDEX_ENABLED"] = "false";
+        off_times: list = [];
         for _ in range(self.iterations) {
+            # Re-stub before every iteration: populate() mutates stubs in-place,
+            # so without this each iteration after the first would use live objects.
+            bench.__jac__.edges = [e.make_stub() for e in bench.__jac__.edges];
             ctx.mem.__mem__.clear();
             t0 = perf_counter();
-            local_results = [here-->(?:TargetNode)];
+            off_results = [bench-->(?:TargetNode)];
             t1 = perf_counter();
-            local_times.append((t1 - t0) * 1000.0);
-
-            ctx.mem.__mem__.clear();
-            t2 = perf_counter();
-            gt_results = [];
-            for tid in target_ids {
-                anchor = ctx.mem.get(UUID(tid));
-                if anchor { gt_results.append(anchor); }
-            }
-            t3 = perf_counter();
-            gt_times.append((t3 - t2) * 1000.0);
-
-            ctx.mem.__mem__.clear();
-            t4 = perf_counter();
-            am_results = [];
-            for tid in am_target_ids {
-                anchor = ctx.mem.get(UUID(tid));
-                if anchor { am_results.append(anchor); }
-            }
-            t5 = perf_counter();
-            am_times.append((t5 - t4) * 1000.0);
+            off_times.append((t1 - t0) * 1000.0);
         }
 
-        avg_local = sum(local_times) / len(local_times);
-        avg_gt    = sum(gt_times) / len(gt_times);
-        avg_am    = sum(am_times) / len(am_times);
-        best_avg  = min(avg_local, avg_gt, avg_am);
-        winner    = ("local" if best_avg == avg_local else ("gt" if best_avg == avg_gt else "am"));
+        # ---- ON cold path: AM miss → GT → warms AM ----
+        os.environ["JAC_INDEX_ENABLED"] = "true";
+        cold_times: list = [];
+        for _ in range(self.iterations) {
+            am_clear();
+            reset_stats();
+            ctx.mem.__mem__.clear();
+            t0 = perf_counter();
+            [bench-->(?:TargetNode)];
+            t1 = perf_counter();
+            cold_times.append((t1 - t0) * 1000.0);
+        }
+        cold_stats  = dict(_stats);
+        on_cold_ms  = _avg(cold_times[1:] if len(cold_times) > 1 else cold_times);
+
+        # ---- ON warm path: AM hit ----
+        on_warm_times: list = [];
+        for _ in range(self.iterations) {
+            ctx.mem.__mem__.clear();   # evict L1, keep AM warm
+            reset_stats();
+            t0 = perf_counter();
+            [bench-->(?:TargetNode)];
+            t1 = perf_counter();
+            on_warm_times.append((t1 - t0) * 1000.0);
+        }
+
+        # ---- Cleanup: delete subgraph ----
+        bench_id = bench.__jac__.id;
+        for child in [bench-->] { del child; }
+        del bench;
+        am_invalidate(bench_id);
+        os.environ["JAC_INDEX_ENABLED"] = "true";
+
+        avg_off  = _avg(off_times[1:] if len(off_times) > 1 else off_times);
+        avg_warm = _avg(on_warm_times[1:] if len(on_warm_times) > 1 else on_warm_times);
+
         report {
-            "local_latency_ms":  round(avg_local, 3),
-            "gt_latency_ms":     round(avg_gt, 3),
-            "am_latency_ms":     round(avg_am, 3),
-            "local_times_ms":    [round(t, 3) for t in local_times],
-            "gt_times_ms":       [round(t, 3) for t in gt_times],
-            "am_times_ms":       [round(t, 3) for t in am_times],
-            "nodes_loaded_local": self.fan_out,
-            "nodes_loaded_gt":    len(target_ids),
-            "nodes_loaded_am":    len(am_target_ids),
-            "winner":     winner,
-            "speedup_gt": round(avg_local / avg_gt, 2) if avg_gt > 0 else 0.0,
-            "speedup_am": round(avg_local / avg_am, 2) if avg_am > 0 else 0.0,
-            "fan_out":     self.fan_out,
-            "selectivity": self.selectivity,
-            "iterations":  self.iterations
+            "scenario":       "single-hop",
+            "fan_out":        fan_out,
+            "selectivity":    round(sel, 2),
+            "off_avg_ms":     round(avg_off, 3),
+            "on_cold_ms":     round(on_cold_ms, 3),
+            "on_warm_avg_ms": round(avg_warm, 3),
+            "speedup_cold":   _speedup(avg_off, on_cold_ms),
+            "speedup_warm":   _speedup(avg_off, avg_warm),
+            "n_results":      len(off_results),
+            "cold_stats":     cold_stats,
+            "iterations":     self.iterations
         };
     }
 }
 
-walker:pub run_all_scenarios {
-    has iterations: int = 5;
-
-    can run_all with Root entry {
-        fan_outs: list = [5, 50, 200, 500];
-        selectivities: list = [0.1, 0.25, 0.5, 0.75, 0.9];
-        all_results: list = [];
-        heatmap: dict = {};
-        ctx = JacRuntimeInterface.get_context();
-
-        for fan_out in fan_outs {
-            for sel in selectivities {
-                target_count = int(fan_out * sel);
-                source_key = str(here.__jac__.id);
-                new_nodes: list = [];
-                gt_iter: dict = {};
-                am_index[source_key] = {};
-
-                for i in range(fan_out) {
-                    if i < target_count {
-                        n = (here ++> TargetNode(node_id=i))[0];
-                    } else {
-                        n = (here ++> OtherNode(node_id=i))[0];
-                    }
-                    tid = str(n.__jac__.id);
-                    new_nodes.append(n);
-                    for type_name in get_type_mro(n) {
-                        if type_name not in gt_iter { gt_iter[type_name] = []; }
-                        gt_iter[type_name].append(tid);
-                        if type_name not in am_index[source_key] { am_index[source_key][type_name] = []; }
-                        am_index[source_key][type_name].append(tid);
-                    }
-                }
-                save_topo({source_key: gt_iter});
-
-                target_ids    = gt_iter.get("TargetNode", []);
-                am_target_ids = am_index.get(source_key, {}).get("TargetNode", []);
-                local_times: list = [];
-                gt_times: list = [];
-                am_times: list = [];
-
-                for _ in range(self.iterations) {
-                    ctx.mem.__mem__.clear();
-                    t0 = perf_counter();
-                    local_results = [here-->(?:TargetNode)];
-                    t1 = perf_counter();
-                    local_times.append((t1 - t0) * 1000.0);
-
-                    ctx.mem.__mem__.clear();
-                    t2 = perf_counter();
-                    gt_res = [];
-                    for tid in target_ids {
-                        anchor = ctx.mem.get(UUID(tid));
-                        if anchor { gt_res.append(anchor); }
-                    }
-                    t3 = perf_counter();
-                    gt_times.append((t3 - t2) * 1000.0);
-
-                    ctx.mem.__mem__.clear();
-                    t4 = perf_counter();
-                    am_res = [];
-                    for tid in am_target_ids {
-                        anchor = ctx.mem.get(UUID(tid));
-                        if anchor { am_res.append(anchor); }
-                    }
-                    t5 = perf_counter();
-                    am_times.append((t5 - t4) * 1000.0);
-                }
-
-                avg_local = sum(local_times) / len(local_times);
-                avg_gt    = sum(gt_times) / len(gt_times);
-                avg_am    = sum(am_times) / len(am_times);
-                best_avg  = min(avg_local, avg_gt, avg_am);
-                winner    = ("local" if best_avg == avg_local else ("gt" if best_avg == avg_gt else "am"));
-                sp_gt = round(avg_local / avg_gt, 2) if avg_gt > 0 else 0.0;
-                sp_am = round(avg_local / avg_am, 2) if avg_am > 0 else 0.0;
-
-                result = {
-                    "local_latency_ms":  round(avg_local, 3),
-                    "gt_latency_ms":     round(avg_gt, 3),
-                    "am_latency_ms":     round(avg_am, 3),
-                    "nodes_loaded_local": fan_out,
-                    "nodes_loaded_gt":    len(target_ids),
-                    "nodes_loaded_am":    len(am_target_ids),
-                    "winner":     winner,
-                    "speedup_gt": sp_gt,
-                    "speedup_am": sp_am,
-                    "fan_out":     fan_out,
-                    "selectivity": sel,
-                    "iterations":  self.iterations
-                };
-                all_results.append(result);
-
-                sel_key = str(int(sel * 100));
-                fo_key  = str(fan_out);
-                if sel_key not in heatmap { heatmap[sel_key] = {}; }
-                heatmap[sel_key][fo_key] = {"speedup_gt": sp_gt, "speedup_am": sp_am, "winner": winner};
-
-                for n in new_nodes { del n; }
-                save_topo({});
-                am_index.clear();
-                ctx.mem.__mem__.clear();
-            }
-        }
-        report {"results": all_results, "heatmap": heatmap};
-    }
-}
-
 # ============================================================================
-# SCENARIO 2 — INHERITANCE
-# Graph:  root -> [PostNode, CommentNode, OtherNode]
-# Seeding: index each node under all MRO types (fan-out at write time).
-#          PostNode  → buckets "PostNode", "BaseContent"
-#          CommentNode → buckets "CommentNode", "BaseContent"
-# Query:  [here-->(?:BaseContent)] — GT/AM look up "BaseContent" bucket,
-#          which already contains PostNode + CommentNode IDs.
-#          Local loads ALL fan_out neighbors then filters by isinstance.
+# SCENARIO 2 — INHERITANCE  (MRO fan-out)
+# Graph:  BenchRoot → [PostNode × n_post | CommentNode × n_comment | OtherNode × n_other]
+# Query:  [bench-->(?:BaseContent)]
+# am_put writes each PostNode under ["PostNode","BaseContent"] at ++> time,
+# and each CommentNode under ["CommentNode","BaseContent"].
+# So AM/GT resolve the "BaseContent" bucket at O(1) without subtype enumeration.
 # ============================================================================
-
-walker:pub seed_inheritance_graph {
-    has fan_out: int = 50,
-        selectivity: float = 0.6;   # fraction of nodes that are BaseContent subclasses
-
-    can seed with Root entry {
-        base_count    = int(self.fan_out * self.selectivity);
-        post_count    = base_count // 2;
-        comment_count = base_count - post_count;
-        other_count   = self.fan_out - base_count;
-
-        source_key = str(here.__jac__.id);
-        gt_full = load_topo();
-        gt_full[source_key] = {};
-        am_index[source_key] = {};
-
-        for i in range(post_count) {
-            n = (here ++> PostNode(node_id=i))[0];
-            tid = str(n.__jac__.id);
-            for type_name in get_type_mro(n) {
-                if type_name not in gt_full[source_key] { gt_full[source_key][type_name] = []; }
-                gt_full[source_key][type_name].append(tid);
-                if type_name not in am_index[source_key] { am_index[source_key][type_name] = []; }
-                am_index[source_key][type_name].append(tid);
-            }
-        }
-        for i in range(comment_count) {
-            n = (here ++> CommentNode(node_id=i))[0];
-            tid = str(n.__jac__.id);
-            for type_name in get_type_mro(n) {
-                if type_name not in gt_full[source_key] { gt_full[source_key][type_name] = []; }
-                gt_full[source_key][type_name].append(tid);
-                if type_name not in am_index[source_key] { am_index[source_key][type_name] = []; }
-                am_index[source_key][type_name].append(tid);
-            }
-        }
-        for i in range(other_count) {
-            n = (here ++> OtherNode(node_id=i))[0];
-            tid = str(n.__jac__.id);
-            for type_name in get_type_mro(n) {
-                if type_name not in gt_full[source_key] { gt_full[source_key][type_name] = []; }
-                gt_full[source_key][type_name].append(tid);
-                if type_name not in am_index[source_key] { am_index[source_key][type_name] = []; }
-                am_index[source_key][type_name].append(tid);
-            }
-        }
-        save_topo(gt_full);
-        report {
-            "status": "seeded",
-            "fan_out": self.fan_out,
-            "post_nodes": post_count,
-            "comment_nodes": comment_count,
-            "other_nodes": other_count,
-            "base_content_total": base_count
-        };
-    }
-}
 
 walker:pub bench_inheritance {
-    has fan_out: int = 50,
-        selectivity: float = 0.6,
+    has n_post:    int = 8,
+        n_comment: int = 8,
+        n_other:   int = 34,
         iterations: int = 5;
 
-    can bench with Root entry {
-        ctx = JacRuntimeInterface.get_context();
-        source_key = str(here.__jac__.id);
-        gt_full = load_topo();
-        base_ids_gt = gt_full.get(source_key, {}).get("BaseContent", []);
-        base_ids_am = am_index.get(source_key, {}).get("BaseContent", []);
+    can run with Root entry {
+        import os;
 
-        if not base_ids_gt {
-            report {"error": "Not seeded. Run seed_inheritance_graph first."};
-            disengage;
-        }
+        # ---- Build isolated subgraph ----
+        bench = (here ++> BenchRoot())[0];
+        for i in range(self.n_post)    { bench ++> PostNode(val=i); }
+        for i in range(self.n_comment) { bench ++> CommentNode(val=i); }
+        for i in range(self.n_other)   { bench ++> OtherNode(val=i); }
 
-        local_times: list = [];
-        gt_times: list = [];
-        am_times: list = [];
+        ctx     = JacRuntimeInterface.get_context();
+        fan_out = self.n_post + self.n_comment + self.n_other;
+        sel     = (self.n_post + self.n_comment) / fan_out if fan_out > 0 else 0.0;
 
+        # ---- OFF path ----
+        os.environ["JAC_INDEX_ENABLED"] = "false";
+        off_times: list = [];
         for _ in range(self.iterations) {
-            # Local: loads ALL fan_out nodes, filters to BaseContent subclasses in memory
+            # Re-stub before every iteration: populate() mutates stubs in-place,
+            # so without this each iteration after the first would use live objects.
+            bench.__jac__.edges = [e.make_stub() for e in bench.__jac__.edges];
             ctx.mem.__mem__.clear();
             t0 = perf_counter();
-            local_results = [here-->(?:BaseContent)];
+            off_results = [bench-->(?:BaseContent)];
             t1 = perf_counter();
-            local_times.append((t1 - t0) * 1000.0);
-
-            # GT: "BaseContent" bucket already contains PostNode + CommentNode IDs
-            ctx.mem.__mem__.clear();
-            t2 = perf_counter();
-            gt_results = [];
-            for tid in base_ids_gt {
-                anchor = ctx.mem.get(UUID(tid));
-                if anchor { gt_results.append(anchor); }
-            }
-            t3 = perf_counter();
-            gt_times.append((t3 - t2) * 1000.0);
-
-            # AM: same as GT but from in-memory dict
-            ctx.mem.__mem__.clear();
-            t4 = perf_counter();
-            am_results = [];
-            for tid in base_ids_am {
-                anchor = ctx.mem.get(UUID(tid));
-                if anchor { am_results.append(anchor); }
-            }
-            t5 = perf_counter();
-            am_times.append((t5 - t4) * 1000.0);
+            off_times.append((t1 - t0) * 1000.0);
         }
 
-        avg_local = sum(local_times) / len(local_times);
-        avg_gt    = sum(gt_times) / len(gt_times);
-        avg_am    = sum(am_times) / len(am_times);
-        best_avg  = min(avg_local, avg_gt, avg_am);
-        winner    = ("local" if best_avg == avg_local else ("gt" if best_avg == avg_gt else "am"));
+        # ---- ON cold path ----
+        os.environ["JAC_INDEX_ENABLED"] = "true";
+        cold_times: list = [];
+        for _ in range(self.iterations) {
+            am_clear();
+            reset_stats();
+            ctx.mem.__mem__.clear();
+            t0 = perf_counter();
+            [bench-->(?:BaseContent)];
+            t1 = perf_counter();
+            cold_times.append((t1 - t0) * 1000.0);
+        }
+        cold_stats = dict(_stats);
+        on_cold_ms = _avg(cold_times[1:] if len(cold_times) > 1 else cold_times);
+
+        # ---- ON warm path ----
+        on_warm_times: list = [];
+        for _ in range(self.iterations) {
+            ctx.mem.__mem__.clear();
+            reset_stats();
+            t0 = perf_counter();
+            [bench-->(?:BaseContent)];
+            t1 = perf_counter();
+            on_warm_times.append((t1 - t0) * 1000.0);
+        }
+
+        # ---- Cleanup ----
+        bench_id = bench.__jac__.id;
+        for child in [bench-->] { del child; }
+        del bench;
+        am_invalidate(bench_id);
+        os.environ["JAC_INDEX_ENABLED"] = "true";
+
+        avg_off  = _avg(off_times[1:] if len(off_times) > 1 else off_times);
+        avg_warm = _avg(on_warm_times[1:] if len(on_warm_times) > 1 else on_warm_times);
+
         report {
-            "local_latency_ms":   round(avg_local, 3),
-            "gt_latency_ms":      round(avg_gt, 3),
-            "am_latency_ms":      round(avg_am, 3),
-            "nodes_loaded_local": self.fan_out,
-            "nodes_loaded_gt":    len(base_ids_gt),
-            "nodes_loaded_am":    len(base_ids_am),
-            "winner":     winner,
-            "speedup_gt": round(avg_local / avg_gt, 2) if avg_gt > 0 else 0.0,
-            "speedup_am": round(avg_local / avg_am, 2) if avg_am > 0 else 0.0,
-            "fan_out":     self.fan_out,
-            "selectivity": self.selectivity,
-            "iterations":  self.iterations,
-            "scenario":    "inheritance"
+            "scenario":       "inheritance",
+            "fan_out":        fan_out,
+            "selectivity":    round(sel, 2),
+            "off_avg_ms":     round(avg_off, 3),
+            "on_cold_ms":     round(on_cold_ms, 3),
+            "on_warm_avg_ms": round(avg_warm, 3),
+            "speedup_cold":   _speedup(avg_off, on_cold_ms),
+            "speedup_warm":   _speedup(avg_off, avg_warm),
+            "n_results":      len(off_results),
+            "cold_stats":     cold_stats,
+            "iterations":     self.iterations
         };
     }
 }
 
 # ============================================================================
 # SCENARIO 3 — MULTI-HOP  (2-hop)
-# Graph:  root --> MidNode[i] --> [TargetNode, OtherNode]
-# Index:  root source_key  → "MidNode": [mid_ids]
-#         each mid_id      → "TargetNode": [target_ids], "OtherNode": [other_ids]
-#
-# Local:  hop1 = [here-->(?:MidNode)]
-#         for each mid, iterate mid.__jac__.edges (outgoing), fetch targets, filter
-#         Cost: mid_count + mid_count × branch_factor SQLite fetches
-#
-# GT/AM:  2 sequential index lookups → bulk fetch of TargetNodes only
-#         Cost: mid_count × selectivity × branch_factor SQLite fetches
+# Graph:  BenchRoot → MidNode[i] → [TargetNode × n_bt | OtherNode × n_bo]
+# OFF:    hop1=[bench-->(?:MidNode)], hop2=for each mid: [mid-->(?:TargetNode)]
+#         → loads all mid bodies + all children of each mid, filters in memory
+# ON:     same expression; index resolves at each hop:
+#         hop1: bench_id "MidNode" → mid_ids
+#         hop2: mid_id   "TargetNode" → target_ids (per mid)
+# Total ON warm fetches = n_mid × n_bt  vs  OFF = n_mid + n_mid×(n_bt+n_bo)
 # ============================================================================
-
-walker:pub seed_multihop_graph {
-    has mid_count: int = 10,
-        branch_factor: int = 20,
-        selectivity: float = 0.3;
-
-    can seed with Root entry {
-        source_key = str(here.__jac__.id);
-        gt_full = load_topo();
-        gt_full[source_key] = {};
-        am_index[source_key] = {};
-
-        target_per_mid = int(self.branch_factor * self.selectivity);
-        total_target = 0;
-
-        for i in range(self.mid_count) {
-            mid = (here ++> MidNode(node_id=i))[0];
-            mid_id = str(mid.__jac__.id);
-
-            # Layer 1: root → MidNode
-            for type_name in get_type_mro(mid) {
-                if type_name not in gt_full[source_key] { gt_full[source_key][type_name] = []; }
-                gt_full[source_key][type_name].append(mid_id);
-                if type_name not in am_index[source_key] { am_index[source_key][type_name] = []; }
-                am_index[source_key][type_name].append(mid_id);
-            }
-
-            # Layer 2: MidNode → [TargetNode, OtherNode]
-            gt_full[mid_id] = {};
-            am_index[mid_id] = {};
-            for j in range(self.branch_factor) {
-                if j < target_per_mid {
-                    child = (mid ++> TargetNode(node_id=j))[0];
-                    total_target += 1;
-                } else {
-                    child = (mid ++> OtherNode(node_id=j))[0];
-                }
-                child_id = str(child.__jac__.id);
-                for type_name in get_type_mro(child) {
-                    if type_name not in gt_full[mid_id] { gt_full[mid_id][type_name] = []; }
-                    gt_full[mid_id][type_name].append(child_id);
-                    if type_name not in am_index[mid_id] { am_index[mid_id][type_name] = []; }
-                    am_index[mid_id][type_name].append(child_id);
-                }
-            }
-        }
-        save_topo(gt_full);
-        report {
-            "status": "seeded",
-            "mid_count": self.mid_count,
-            "branch_factor": self.branch_factor,
-            "selectivity": self.selectivity,
-            "total_mid_nodes": self.mid_count,
-            "total_target_nodes": total_target,
-            "total_other_nodes": self.mid_count * self.branch_factor - total_target
-        };
-    }
-}
 
 walker:pub bench_multihop {
-    has mid_count: int = 10,
-        branch_factor: int = 20,
-        selectivity: float = 0.3,
+    has n_mid:    int = 15,
+        n_bt:     int = 6,    # branch TargetNodes per MidNode
+        n_bo:     int = 14,   # branch OtherNodes per MidNode
         iterations: int = 5;
 
-    can bench with Root entry {
-        ctx = JacRuntimeInterface.get_context();
-        source_key = str(here.__jac__.id);
-        gt_full = load_topo();
+    can run with Root entry {
+        import os;
 
-        mid_ids_gt = gt_full.get(source_key, {}).get("MidNode", []);
-        if not mid_ids_gt {
-            report {"error": "Not seeded. Run seed_multihop_graph first."};
-            disengage;
+        # ---- Build isolated subgraph ----
+        bench = (here ++> BenchRoot())[0];
+        for i in range(self.n_mid) {
+            mid = (bench ++> MidNode(val=i))[0];
+            for j in range(self.n_bt) { mid ++> TargetNode(val=j); }
+            for j in range(self.n_bo) { mid ++> OtherNode(val=j); }
         }
 
-        # Pre-resolve 2-hop target IDs via index (no SQLite yet)
-        target_ids_gt: list = [];
-        for mid_id in mid_ids_gt {
-            target_ids_gt += gt_full.get(mid_id, {}).get("TargetNode", []);
-        }
-        mid_ids_am = am_index.get(source_key, {}).get("MidNode", []);
-        target_ids_am: list = [];
-        for mid_id in mid_ids_am {
-            target_ids_am += am_index.get(mid_id, {}).get("TargetNode", []);
+        ctx          = JacRuntimeInterface.get_context();
+        branch_total = self.n_bt + self.n_bo;
+        sel          = self.n_bt / branch_total if branch_total > 0 else 0.0;
+
+        def _run_2hop -> list {
+            mids = [bench-->(?:MidNode)];
+            targets: list = [];
+            for mid in mids { targets += [mid-->(?:TargetNode)]; }
+            return targets;
         }
 
-        local_times: list = [];
-        gt_times: list = [];
-        am_times: list = [];
-
+        # ---- OFF path ----
+        os.environ["JAC_INDEX_ENABLED"] = "false";
+        off_times: list = [];
         for _ in range(self.iterations) {
-            # Local 2-hop: load MidNodes (hop 1), then for each mid scan its outgoing
-            # edges and fetch+filter TargetNode children (hop 2).
+            # Re-stub before every iteration: populate() mutates stubs in-place,
+            # so without this each iteration after the first would use live objects.
+            # MidNode anchors from SQLite already carry stub edges (via __getstate__),
+            # so the second hop also goes cold automatically.
+            bench.__jac__.edges = [e.make_stub() for e in bench.__jac__.edges];
             ctx.mem.__mem__.clear();
             t0 = perf_counter();
-            hop1 = [here-->(?:MidNode)];
-            local_2hop: list = [];
-            for mid in hop1 {
-                mid_id_str = str(mid.__jac__.id);
-                for edge in mid.__jac__.edges {
-                    if str(edge.source.id) == mid_id_str {      # outgoing edges only
-                        target_anchor = ctx.mem.get(edge.target.id);
-                        if target_anchor and isinstance(target_anchor.archetype, TargetNode) {
-                            local_2hop.append(target_anchor);
-                        }
-                    }
-                }
-            }
+            off_results = _run_2hop();
             t1 = perf_counter();
-            local_times.append((t1 - t0) * 1000.0);
-
-            # GT 2-hop: index resolved target IDs → bulk fetch from SQLite
-            ctx.mem.__mem__.clear();
-            t2 = perf_counter();
-            gt_2hop: list = [];
-            for tid in target_ids_gt {
-                anchor = ctx.mem.get(UUID(tid));
-                if anchor { gt_2hop.append(anchor); }
-            }
-            t3 = perf_counter();
-            gt_times.append((t3 - t2) * 1000.0);
-
-            # AM 2-hop: same as GT but index lookup is pure in-memory
-            ctx.mem.__mem__.clear();
-            t4 = perf_counter();
-            am_2hop: list = [];
-            for tid in target_ids_am {
-                anchor = ctx.mem.get(UUID(tid));
-                if anchor { am_2hop.append(anchor); }
-            }
-            t5 = perf_counter();
-            am_times.append((t5 - t4) * 1000.0);
+            off_times.append((t1 - t0) * 1000.0);
         }
 
-        avg_local = sum(local_times) / len(local_times);
-        avg_gt    = sum(gt_times) / len(gt_times);
-        avg_am    = sum(am_times) / len(am_times);
-        best_avg  = min(avg_local, avg_gt, avg_am);
-        winner    = ("local" if best_avg == avg_local else ("gt" if best_avg == avg_gt else "am"));
-        total_local_fetches = self.mid_count + self.mid_count * self.branch_factor;
+        # ---- ON cold path ----
+        os.environ["JAC_INDEX_ENABLED"] = "true";
+        cold_times: list = [];
+        for _ in range(self.iterations) {
+            am_clear();
+            reset_stats();
+            ctx.mem.__mem__.clear();
+            t0 = perf_counter();
+            _run_2hop();
+            t1 = perf_counter();
+            cold_times.append((t1 - t0) * 1000.0);
+        }
+        cold_stats = dict(_stats);
+        on_cold_ms = _avg(cold_times[1:] if len(cold_times) > 1 else cold_times);
+
+        # ---- ON warm path ----
+        on_warm_times: list = [];
+        for _ in range(self.iterations) {
+            ctx.mem.__mem__.clear();
+            reset_stats();
+            t0 = perf_counter();
+            _run_2hop();
+            t1 = perf_counter();
+            on_warm_times.append((t1 - t0) * 1000.0);
+        }
+
+        # ---- Cleanup ----
+        bench_id = bench.__jac__.id;
+        for mid in [bench-->(?:MidNode)] {
+            mid_id = mid.__jac__.id;
+            for child in [mid-->] { del child; }
+            del mid;
+            am_invalidate(mid_id);
+        }
+        del bench;
+        am_invalidate(bench_id);
+        os.environ["JAC_INDEX_ENABLED"] = "true";
+
+        avg_off  = _avg(off_times[1:] if len(off_times) > 1 else off_times);
+        avg_warm = _avg(on_warm_times[1:] if len(on_warm_times) > 1 else on_warm_times);
+
         report {
-            "local_latency_ms":   round(avg_local, 3),
-            "gt_latency_ms":      round(avg_gt, 3),
-            "am_latency_ms":      round(avg_am, 3),
-            "nodes_loaded_local": total_local_fetches,
-            "nodes_loaded_gt":    len(target_ids_gt),
-            "nodes_loaded_am":    len(target_ids_am),
-            "winner":     winner,
-            "speedup_gt": round(avg_local / avg_gt, 2) if avg_gt > 0 else 0.0,
-            "speedup_am": round(avg_local / avg_am, 2) if avg_am > 0 else 0.0,
-            "mid_count":    self.mid_count,
-            "branch_factor": self.branch_factor,
-            "selectivity":  self.selectivity,
-            "iterations":   self.iterations,
-            "scenario":     "multihop"
+            "scenario":       "multi-hop",
+            "n_mid":          self.n_mid,
+            "branch_factor":  branch_total,
+            "selectivity":    round(sel, 2),
+            "off_avg_ms":     round(avg_off, 3),
+            "on_cold_ms":     round(on_cold_ms, 3),
+            "on_warm_avg_ms": round(avg_warm, 3),
+            "speedup_cold":   _speedup(avg_off, on_cold_ms),
+            "speedup_warm":   _speedup(avg_off, avg_warm),
+            "n_results":      len(off_results),
+            "cold_stats":     cold_stats,
+            "iterations":     self.iterations
         };
     }
 }
 
 # ============================================================================
-# SCENARIO 4 — ARBITRARY START NODE
-# Uses the multi-hop graph (seed_multihop_graph must have run first).
-# Picks the first MidNode as a non-root starting point and benchmarks
-# [midnode-->(?:TargetNode)] from there.
-#
-# Local: fetch MidNode anchor from SQLite, iterate its outgoing edges,
-#        fetch each child anchor, filter by type.
-# GT:    gt_full[mid_id]["TargetNode"] — direct lookup by MidNode's own key.
-# AM:    am_index[mid_id]["TargetNode"] — same but in-memory.
-#
-# This demonstrates that both indexes are source-agnostic: the index is keyed
-# by source node ID, so any node in the graph (not just root) can be the
-# starting point of an O(1) index lookup.
+# RUN ALL — full fan_out × selectivity grid for heatmap
 # ============================================================================
 
-walker:pub bench_arbitrary_start {
+walker:pub run_all_scenarios {
     has iterations: int = 5;
 
-    can bench with Root entry {
-        ctx = JacRuntimeInterface.get_context();
-        source_key = str(here.__jac__.id);
-        gt_full = load_topo();
+    can run_all with Root entry {
+        import os;
+        ctx         = JacRuntimeInterface.get_context();
+        fan_outs    = [5, 50, 200, 500];
+        selectivities = [0.1, 0.25, 0.5, 0.75, 0.9];
+        all_results: list = [];
+        heatmap:     dict = {};
 
-        mid_ids = gt_full.get(source_key, {}).get("MidNode", []);
-        if not mid_ids {
-            report {"error": "No multi-hop graph found. Run seed_multihop_graph first."};
-            disengage;
-        }
+        for fan_out in fan_outs {
+            for sel in selectivities {
+                n_targets = int(fan_out * sel);
+                n_others  = fan_out - n_targets;
 
-        # Use the first MidNode as our arbitrary non-root start point
-        arb_mid_id        = mid_ids[0];
-        arb_tgt_ids_gt    = gt_full.get(arb_mid_id, {}).get("TargetNode", []);
-        arb_tgt_ids_am    = am_index.get(arb_mid_id, {}).get("TargetNode", []);
-        branch_total      = (
-            len(gt_full.get(arb_mid_id, {}).get("TargetNode", [])) +
-            len(gt_full.get(arb_mid_id, {}).get("OtherNode", []))
-        );
+                bench = (here ++> BenchRoot())[0];
+                for i in range(n_targets) { bench ++> TargetNode(val=i); }
+                for i in range(n_others)  { bench ++> OtherNode(val=i); }
 
-        local_times: list = [];
-        gt_times: list = [];
-        am_times: list = [];
-
-        for _ in range(self.iterations) {
-            # Local: fetch MidNode from SQLite, then scan its outgoing edges
-            ctx.mem.__mem__.clear();
-            t0 = perf_counter();
-            mid_anchor = ctx.mem.get(UUID(arb_mid_id));
-            local_arb: list = [];
-            if mid_anchor {
-                for edge in mid_anchor.edges {
-                    if str(edge.source.id) == arb_mid_id {   # outgoing edges only
-                        target_anchor = ctx.mem.get(edge.target.id);
-                        if target_anchor and isinstance(target_anchor.archetype, TargetNode) {
-                            local_arb.append(target_anchor);
-                        }
-                    }
+                # OFF
+                os.environ["JAC_INDEX_ENABLED"] = "false";
+                off_times: list = [];
+                for _ in range(self.iterations) {
+                    bench.__jac__.edges = [e.make_stub() for e in bench.__jac__.edges];
+                    ctx.mem.__mem__.clear();
+                    t0 = perf_counter();
+                    [bench-->(?:TargetNode)];
+                    t1 = perf_counter();
+                    off_times.append((t1 - t0) * 1000.0);
                 }
-            }
-            t1 = perf_counter();
-            local_times.append((t1 - t0) * 1000.0);
 
-            # GT: direct lookup using MidNode's ID as source key
-            ctx.mem.__mem__.clear();
-            t2 = perf_counter();
-            gt_arb: list = [];
-            for tid in arb_tgt_ids_gt {
-                anchor = ctx.mem.get(UUID(tid));
-                if anchor { gt_arb.append(anchor); }
-            }
-            t3 = perf_counter();
-            gt_times.append((t3 - t2) * 1000.0);
+                # ON cold
+                os.environ["JAC_INDEX_ENABLED"] = "true";
+                cold_times: list = [];
+                for _ in range(self.iterations) {
+                    am_clear();
+                    reset_stats();
+                    ctx.mem.__mem__.clear();
+                    t0 = perf_counter();
+                    [bench-->(?:TargetNode)];
+                    t1 = perf_counter();
+                    cold_times.append((t1 - t0) * 1000.0);
+                }
+                on_cold_ms = _avg(cold_times[1:] if len(cold_times) > 1 else cold_times);
 
-            # AM: same as GT, but from in-process dict
-            ctx.mem.__mem__.clear();
-            t4 = perf_counter();
-            am_arb: list = [];
-            for tid in arb_tgt_ids_am {
-                anchor = ctx.mem.get(UUID(tid));
-                if anchor { am_arb.append(anchor); }
+                # ON warm
+                on_warm_times: list = [];
+                for _ in range(self.iterations) {
+                    ctx.mem.__mem__.clear();
+                    reset_stats();
+                    t0 = perf_counter();
+                    [bench-->(?:TargetNode)];
+                    t1 = perf_counter();
+                    on_warm_times.append((t1 - t0) * 1000.0);
+                }
+
+                # Cleanup
+                bench_id = bench.__jac__.id;
+                for child in [bench-->] { del child; }
+                del bench;
+                am_invalidate(bench_id);
+                os.environ["JAC_INDEX_ENABLED"] = "true";
+                am_clear();
+                ctx.mem.__mem__.clear();
+
+                avg_off  = _avg(off_times[1:] if len(off_times) > 1 else off_times);
+                avg_warm = _avg(on_warm_times[1:] if len(on_warm_times) > 1 else on_warm_times);
+                sp_cold  = _speedup(avg_off, on_cold_ms);
+                sp_warm  = _speedup(avg_off, avg_warm);
+
+                result = {
+                    "scenario":       "single-hop",
+                    "fan_out":        fan_out,
+                    "selectivity":    round(sel, 2),
+                    "off_avg_ms":     round(avg_off, 3),
+                    "on_cold_ms":     round(on_cold_ms, 3),
+                    "on_warm_avg_ms": round(avg_warm, 3),
+                    "speedup_cold":   sp_cold,
+                    "speedup_warm":   sp_warm,
+                    "iterations":     self.iterations
+                };
+                all_results.append(result);
+
+                sel_key = str(int(sel * 100));
+                fo_key  = str(fan_out);
+                if sel_key not in heatmap { heatmap[sel_key] = {}; }
+                heatmap[sel_key][fo_key] = {
+                    "speedup_cold": sp_cold,
+                    "speedup_warm": sp_warm
+                };
             }
-            t5 = perf_counter();
-            am_times.append((t5 - t4) * 1000.0);
         }
 
-        avg_local = sum(local_times) / len(local_times);
-        avg_gt    = sum(gt_times) / len(gt_times);
-        avg_am    = sum(am_times) / len(am_times);
-        best_avg  = min(avg_local, avg_gt, avg_am);
-        winner    = ("local" if best_avg == avg_local else ("gt" if best_avg == avg_gt else "am"));
-        report {
-            "local_latency_ms":   round(avg_local, 3),
-            "gt_latency_ms":      round(avg_gt, 3),
-            "am_latency_ms":      round(avg_am, 3),
-            "nodes_loaded_local": branch_total,
-            "nodes_loaded_gt":    len(arb_tgt_ids_gt),
-            "nodes_loaded_am":    len(arb_tgt_ids_am),
-            "winner":      winner,
-            "speedup_gt":  round(avg_local / avg_gt, 2) if avg_gt > 0 else 0.0,
-            "speedup_am":  round(avg_local / avg_am, 2) if avg_am > 0 else 0.0,
-            "start_node":  arb_mid_id,
-            "iterations":  self.iterations,
-            "scenario":    "arbitrary_start"
-        };
+        report {"results": all_results, "heatmap": heatmap};
     }
 }
 
 # ============================================================================
-# WALKER: clear_graph
-# Clears all node types from all four scenarios.
+# CLEAR — remove any leftover BenchRoot containers from interrupted runs
 # ============================================================================
 
 walker:pub clear_graph {
     can clear with Root entry {
-        # Delete root's direct children (single-hop + inheritance scenarios)
-        for n in [here-->(?:TargetNode)] { del n; }
-        for n in [here-->(?:OtherNode)]  { del n; }
-        for n in [here-->(?:PostNode)]   { del n; }
-        for n in [here-->(?:CommentNode)] { del n; }
-        # Delete MidNode children first, then the MidNodes themselves
-        # (avoids nested visit-inside-handler recursion)
-        for mid in [here-->(?:MidNode)] {
-            for n in [mid-->(?:TargetNode)] { del n; }
-            for n in [mid-->(?:OtherNode)]  { del n; }
-            del mid;
+        for bench in [here-->(?:BenchRoot)] {
+            bench_id = bench.__jac__.id;
+            for mid in [bench-->(?:MidNode)] {
+                mid_id = mid.__jac__.id;
+                for child in [mid-->] { del child; }
+                del mid;
+                am_invalidate(mid_id);
+            }
+            for child in [bench-->] { del child; }
+            del bench;
+            am_invalidate(bench_id);
         }
-        save_topo({});
-        am_index.clear();
+        am_clear();
         report {"status": "cleared"};
     }
 }
@@ -767,217 +497,135 @@ walker:pub clear_graph {
 cl {
     def:pub app -> JsxElement {
         # Shared
-        has activeTab: str = "singlehop",
-            error: str = "",
-            status: str = "",
-            loading: bool = False;
+        has activeTab: str = "singlehop";
 
-        # Single-hop tab state
+        # Single-hop tab
         has fanOut: int = 50,
-            selectivity: float = 0.5,
+            selectivity: float = 0.1,
             iterations: int = 5,
-            results: list = [],
-            heatmap: dict = {},
+            shLoading: bool = False,
+            shStatus: str = "",
+            shError: str = "",
+            shResults: list = [],
+            shHeatmap: dict = {},
             showHeatmap: bool = False,
-            seeding: bool = False,
             runningAll: bool = False;
 
-        # Inheritance tab state
-        has inheritFanOut: int = 50,
-            inheritSelectivity: float = 0.6,
-            inheritIters: int = 5,
-            inheritSeeding: bool = False,
-            inheritBenching: bool = False,
-            inheritResults: list = [],
-            inheritStatus: str = "",
-            inheritError: str = "";
+        # Inheritance tab
+        has inhFanOut: int = 50,
+            inhSel: float = 0.32,
+            inhIters: int = 5,
+            inhLoading: bool = False,
+            inhStatus: str = "",
+            inhError: str = "",
+            inhResults: list = [];
 
-        # Multi-hop tab state
-        has midCount: int = 10,
-            branchFactor: int = 20,
-            multihopSel: float = 0.3,
-            multihopIters: int = 5,
-            multihopSeeding: bool = False,
-            multihopBenching: bool = False,
-            multihopResults: list = [],
-            multihopStatus: str = "",
-            multihopError: str = "";
-
-        # Arbitrary start tab state (reuses multi-hop graph, no separate seeding)
-        has arbIters: int = 5,
-            arbBenching: bool = False,
-            arbResults: list = [],
-            arbStatus: str = "",
-            arbError: str = "";
+        # Multi-hop tab
+        has mhMid: int = 15,
+            mhBt: int = 6,
+            mhBo: int = 14,
+            mhIters: int = 5,
+            mhLoading: bool = False,
+            mhStatus: str = "",
+            mhError: str = "",
+            mhResults: list = [];
 
         # ---- Single-hop handlers ----
-        async def handleSeed -> None {
-            seeding = True;
-            status = "Seeding graph...";
-            error = "";
+        async def handleBenchSingleHop -> None {
+            shLoading = True;
+            shStatus = "Running...";
+            shError = "";
             try {
-                resp = root spawn seed_graph(fan_out=fanOut, selectivity=selectivity);
-                info = resp.reports[0];
-                status = f"Seeded: {info['target_nodes']} TargetNodes + {info['other_nodes']} OtherNodes";
-            } except Exception as e {
-                error = str(e);
-                status = "";
-            }
-            seeding = False;
-        }
-
-        async def handleBenchmark -> None {
-            loading = True;
-            status = "Running benchmark...";
-            error = "";
-            try {
-                resp = root spawn run_benchmark(fan_out=fanOut, selectivity=selectivity, iterations=iterations);
+                n_targets = int(fanOut * selectivity);
+                n_others  = fanOut - n_targets;
+                resp = root spawn bench_single_hop(
+                    n_targets=n_targets, n_others=n_others, iterations=iterations
+                );
                 r = resp.reports[0];
-                if "error" in r {
-                    error = r["error"];
-                    status = "";
-                } else {
-                    results = results + [r];
-                    status = f"Done. Winner: {r['winner']} (GT {r['speedup_gt']}x, AM {r['speedup_am']}x vs local)";
-                }
+                shResults = shResults + [r];
+                shStatus = f"Done — OFF {r['off_avg_ms']} ms  |  ON cold {r['on_cold_ms']} ms  |  ON warm {r['on_warm_avg_ms']} ms  |  warm speedup {r['speedup_warm']}×";
             } except Exception as e {
-                error = str(e);
-                status = "";
+                shError = str(e);
+                shStatus = "";
             }
-            loading = False;
+            shLoading = False;
         }
 
         async def handleRunAll -> None {
             runningAll = True;
-            loading = True;
-            status = "Running all 20 scenarios (4 fan-outs × 5 selectivities)...";
-            error = "";
+            shLoading = True;
+            shStatus = "Running full grid (4 fan-outs × 5 selectivities = 20 scenarios)…";
+            shError = "";
             try {
                 resp = root spawn run_all_scenarios(iterations=iterations);
                 r = resp.reports[0];
-                results = results + r["results"];
-                heatmap = r["heatmap"];
+                shResults = shResults + r["results"];
+                shHeatmap = r["heatmap"];
                 showHeatmap = True;
-                status = f"All scenarios complete: {len(r['results'])} runs added.";
+                shStatus = f"Grid complete — {len(r['results'])} scenarios added.";
             } except Exception as e {
-                error = str(e);
-                status = "";
+                shError = str(e);
+                shStatus = "";
             }
-            loading = False;
+            shLoading = False;
             runningAll = False;
         }
 
+        # ---- Inheritance handler ----
+        async def handleBenchInheritance -> None {
+            inhLoading = True;
+            inhStatus = "Running...";
+            inhError = "";
+            try {
+                base_count = int(inhFanOut * inhSel);
+                n_post     = base_count // 2;
+                n_comment  = base_count - n_post;
+                n_other    = inhFanOut - base_count;
+                resp = root spawn bench_inheritance(
+                    n_post=n_post, n_comment=n_comment, n_other=n_other, iterations=inhIters
+                );
+                r = resp.reports[0];
+                inhResults = inhResults + [r];
+                inhStatus = f"Done — OFF {r['off_avg_ms']} ms  |  ON warm {r['on_warm_avg_ms']} ms  |  warm speedup {r['speedup_warm']}×";
+            } except Exception as e {
+                inhError = str(e);
+                inhStatus = "";
+            }
+            inhLoading = False;
+        }
+
+        # ---- Multi-hop handler ----
+        async def handleBenchMultihop -> None {
+            mhLoading = True;
+            mhStatus = "Running...";
+            mhError = "";
+            try {
+                resp = root spawn bench_multihop(
+                    n_mid=mhMid, n_bt=mhBt, n_bo=mhBo, iterations=mhIters
+                );
+                r = resp.reports[0];
+                mhResults = mhResults + [r];
+                mhStatus = f"Done — OFF {r['off_avg_ms']} ms  |  ON warm {r['on_warm_avg_ms']} ms  |  warm speedup {r['speedup_warm']}×";
+            } except Exception as e {
+                mhError = str(e);
+                mhStatus = "";
+            }
+            mhLoading = False;
+        }
+
+        # ---- Clear handler ----
         async def handleClear -> None {
-            status = "Clearing...";
-            error = "";
             try {
                 root spawn clear_graph();
-                results = [];
-                heatmap = {};
+                shResults = [];
+                shHeatmap = {};
                 showHeatmap = False;
-                inheritResults = [];
-                multihopResults = [];
-                arbResults = [];
-                status = "Cleared.";
+                inhResults = [];
+                mhResults = [];
+                shStatus = "Cleared.";
             } except Exception as e {
-                error = str(e);
+                shError = str(e);
             }
-        }
-
-        # ---- Inheritance handlers ----
-        async def handleSeedInheritance -> None {
-            inheritSeeding = True;
-            inheritStatus = "Seeding...";
-            inheritError = "";
-            try {
-                resp = root spawn seed_inheritance_graph(fan_out=inheritFanOut, selectivity=inheritSelectivity);
-                info = resp.reports[0];
-                inheritStatus = f"Seeded: {info['post_nodes']} PostNodes + {info['comment_nodes']} CommentNodes + {info['other_nodes']} OtherNodes (BaseContent total: {info['base_content_total']})";
-            } except Exception as e {
-                inheritError = str(e);
-                inheritStatus = "";
-            }
-            inheritSeeding = False;
-        }
-
-        async def handleBenchInheritance -> None {
-            inheritBenching = True;
-            inheritStatus = "Running...";
-            inheritError = "";
-            try {
-                resp = root spawn bench_inheritance(fan_out=inheritFanOut, selectivity=inheritSelectivity, iterations=inheritIters);
-                r = resp.reports[0];
-                if "error" in r {
-                    inheritError = r["error"];
-                    inheritStatus = "";
-                } else {
-                    inheritResults = inheritResults + [r];
-                    inheritStatus = f"Done. Winner: {r['winner']} (GT {r['speedup_gt']}x, AM {r['speedup_am']}x vs local)";
-                }
-            } except Exception as e {
-                inheritError = str(e);
-                inheritStatus = "";
-            }
-            inheritBenching = False;
-        }
-
-        # ---- Multi-hop handlers ----
-        async def handleSeedMultihop -> None {
-            multihopSeeding = True;
-            multihopStatus = "Seeding...";
-            multihopError = "";
-            try {
-                resp = root spawn seed_multihop_graph(mid_count=midCount, branch_factor=branchFactor, selectivity=multihopSel);
-                info = resp.reports[0];
-                multihopStatus = f"Seeded: {info['total_mid_nodes']} MidNodes, each with {branchFactor} children ({info['total_target_nodes']} TargetNodes + {info['total_other_nodes']} OtherNodes)";
-            } except Exception as e {
-                multihopError = str(e);
-                multihopStatus = "";
-            }
-            multihopSeeding = False;
-        }
-
-        async def handleBenchMultihop -> None {
-            multihopBenching = True;
-            multihopStatus = "Running...";
-            multihopError = "";
-            try {
-                resp = root spawn bench_multihop(mid_count=midCount, branch_factor=branchFactor, selectivity=multihopSel, iterations=multihopIters);
-                r = resp.reports[0];
-                if "error" in r {
-                    multihopError = r["error"];
-                    multihopStatus = "";
-                } else {
-                    multihopResults = multihopResults + [r];
-                    multihopStatus = f"Done. Winner: {r['winner']} (GT {r['speedup_gt']}x, AM {r['speedup_am']}x vs local)";
-                }
-            } except Exception as e {
-                multihopError = str(e);
-                multihopStatus = "";
-            }
-            multihopBenching = False;
-        }
-
-        # ---- Arbitrary start handlers ----
-        async def handleBenchArbitrary -> None {
-            arbBenching = True;
-            arbStatus = "Running...";
-            arbError = "";
-            try {
-                resp = root spawn bench_arbitrary_start(iterations=arbIters);
-                r = resp.reports[0];
-                if "error" in r {
-                    arbError = r["error"];
-                    arbStatus = "";
-                } else {
-                    arbResults = arbResults + [r];
-                    arbStatus = f"Done from node {r['start_node'][:8]}…  Winner: {r['winner']} (GT {r['speedup_gt']}x, AM {r['speedup_am']}x vs local)";
-                }
-            } except Exception as e {
-                arbError = str(e);
-                arbStatus = "";
-            }
-            arbBenching = False;
         }
 
         # ---- Style helpers ----
@@ -1004,29 +652,29 @@ cl {
             return {
                 "padding": "10px 20px", "cursor": "pointer", "border": "none",
                 "borderBottom": ("3px solid #0ea5e9" if active else "3px solid transparent"),
-                "background": "none", "fontSize": "14px", "fontWeight": ("700" if active else "400"),
+                "background": "none", "fontSize": "14px",
+                "fontWeight": ("700" if active else "400"),
                 "color": ("#0ea5e9" if active else "#64748b")
             };
         };
 
-        # ---- Results bar chart helper ----
-        def barRow(label: str, color: str, val: float, maxVal: float, key: str) -> JsxElement {
+        # ---- Bar chart helper: 3 bars per result ----
+        def barRow(label: str, color: str, val: float, maxVal: float) -> JsxElement {
             return
-                <div key={key} style={{"display": "flex", "alignItems": "center", "gap": "8px", "marginBottom": "4px"}}>
-                    <span style={{"width": "60px", "fontSize": "12px", "color": color, "textAlign": "right"}}>{label}</span>
+                <div style={{"display": "flex", "alignItems": "center", "gap": "8px", "marginBottom": "4px"}}>
+                    <span style={{"width": "72px", "fontSize": "12px", "color": color, "textAlign": "right", "fontWeight": "600"}}>{label}</span>
                     <div style={{
                         "height": "20px", "background": color, "borderRadius": "3px",
-                        "width": f"{min(val / max(maxVal, 0.001) * 400, 400)}px",
+                        "width": f"{min(val / max(maxVal, 0.001) * 380, 380)}px",
                         "minWidth": "2px"
                     }}/>
                     <span style={{"fontSize": "12px", "fontFamily": "monospace", "color": color}}>{round(val, 3)} ms</span>
                 </div>;
         }
 
-        # ---- Shared results table ----
-        def resultsTable(rows: list, extraCols: list = []) -> JsxElement {
-            baseCols = ["Scenario", "Local avg (ms)", "GT avg (ms)", "AM avg (ms)", "Nodes Local", "Nodes GT/AM", "Speedup GT", "Speedup AM", "Winner"];
-            cols = baseCols;
+        # ---- Results table ----
+        def resultsTable(rows: list) -> JsxElement {
+            cols = ["Scenario", "Fan Out", "Selectivity", "OFF avg (ms)", "ON cold (ms)", "ON warm avg (ms)", "Speedup cold", "Speedup warm", "Results"];
             return
                 <div style={{"overflowX": "auto"}}>
                     <table style={{"width": "100%", "borderCollapse": "collapse", "fontSize": "13px"}}>
@@ -1041,22 +689,15 @@ cl {
                         <tbody>
                             {[
                                 <tr key={i} style={{"borderBottom": "1px solid #f1f5f9"}}>
-                                    <td style={{"padding": "10px 14px", "fontSize": "12px", "color": "#64748b"}}>{r.get("scenario", f"fan={r.get('fan_out', r.get('mid_count','?'))}")}</td>
-                                    <td style={{"padding": "10px 14px", "fontFamily": "monospace", "color": "#7c3aed"}}>{r["local_latency_ms"]}</td>
-                                    <td style={{"padding": "10px 14px", "fontFamily": "monospace", "color": "#0369a1"}}>{r["gt_latency_ms"]}</td>
-                                    <td style={{"padding": "10px 14px", "fontFamily": "monospace", "color": "#065f46"}}>{r["am_latency_ms"]}</td>
-                                    <td style={{"padding": "10px 14px", "color": "#64748b"}}>{r["nodes_loaded_local"]}</td>
-                                    <td style={{"padding": "10px 14px", "color": "#64748b"}}>{r["nodes_loaded_gt"]}</td>
-                                    <td style={{"padding": "10px 14px", "fontFamily": "monospace"}}>{r["speedup_gt"]}x</td>
-                                    <td style={{"padding": "10px 14px", "fontFamily": "monospace"}}>{r["speedup_am"]}x</td>
-                                    <td style={{"padding": "10px 14px"}}>
-                                        <span style={{
-                                            "padding": "3px 10px", "borderRadius": "12px",
-                                            "fontWeight": "600", "fontSize": "12px",
-                                            "background": ("#d1fae5" if r["winner"] == "am" else ("#dbeafe" if r["winner"] == "gt" else "#ede9fe")),
-                                            "color": ("#065f46" if r["winner"] == "am" else ("#1e40af" if r["winner"] == "gt" else "#5b21b6"))
-                                        }}>{r["winner"]}</span>
-                                    </td>
+                                    <td style={{"padding": "10px 14px", "fontSize": "12px", "color": "#64748b"}}>{r["scenario"] or "—"}</td>
+                                    <td style={{"padding": "10px 14px", "fontFamily": "monospace"}}>{r["fan_out"] or r["n_mid"] or "—"}</td>
+                                    <td style={{"padding": "10px 14px", "fontFamily": "monospace"}}>{f"{int((r['selectivity'] or 0)*100)}%"}</td>
+                                    <td style={{"padding": "10px 14px", "fontFamily": "monospace", "color": "#7c3aed"}}>{r["off_avg_ms"]}</td>
+                                    <td style={{"padding": "10px 14px", "fontFamily": "monospace", "color": "#0369a1"}}>{r["on_cold_ms"]}</td>
+                                    <td style={{"padding": "10px 14px", "fontFamily": "monospace", "color": "#065f46"}}>{r["on_warm_avg_ms"]}</td>
+                                    <td style={{"padding": "10px 14px", "fontFamily": "monospace"}}>{r["speedup_cold"]}×</td>
+                                    <td style={{"padding": "10px 14px", "fontFamily": "monospace", "fontWeight": "700", "color": "#0369a1"}}>{r["speedup_warm"]}×</td>
+                                    <td style={{"padding": "10px 14px", "color": "#64748b"}}>{r["n_results"] or "—"}</td>
                                 </tr>
                                 for (i, r) in enumerate(rows)
                             ]}
@@ -1065,35 +706,182 @@ cl {
                 </div>;
         }
 
+        # ---- Stats pill helper ----
+        def statsPill(label: str, val: int, color: str) -> JsxElement {
+            return
+                <span style={{
+                    "display": "inline-block", "padding": "2px 10px",
+                    "borderRadius": "12px", "background": color,
+                    "color": "#fff", "fontSize": "11px", "fontWeight": "600",
+                    "marginRight": "6px"
+                }}>{label}: {val}</span>;
+        }
+
+        # ---- Interpretation badge: warm speedup ratio → colored label ----
+        # Thresholds reflect realistic AM/GT speedup range observed in practice.
+        def interpBadge(sp: float) -> JsxElement {
+            label: str = "";
+            bg: str = "";
+            col: str = "";
+            if sp >= 2.0    { label = "Strong win";      bg = "#dcfce7"; col = "#166534"; }
+            elif sp >= 1.3  { label = "Moderate win";    bg = "#d1fae5"; col = "#065f46"; }
+            elif sp >= 1.1  { label = "Slight win";      bg = "#ccfbf1"; col = "#0f766e"; }
+            elif sp >= 0.95 { label = "Roughly equal";   bg = "#f1f5f9"; col = "#475569"; }
+            elif sp >= 0.8  { label = "Slight overhead"; bg = "#fef3c7"; col = "#b45309"; }
+            else            { label = "Index slower";    bg = "#fee2e2"; col = "#991b1b"; }
+            # Pre-compute text before JSX return: {sp} inside a JSX f-string resolves
+            # in component scope (undefined), not the function parameter scope.
+            text: str = f"{label} ({sp}×)";
+            return <span style={{
+                "display": "inline-block", "padding": "2px 10px", "borderRadius": "20px",
+                "background": bg, "color": col, "fontSize": "11px", "fontWeight": "700",
+                "whiteSpace": "nowrap"
+            }}>{text}</span>;
+        }
+
+        # ---- Aggregated summary panel: shown when > 1 run accumulated ----
+        def summaryPanel(rows: list, group_key: str) -> JsxElement {
+            if len(rows) < 2 { return <span/>; }
+            all_warm = [r["speedup_warm"] or 0.0 for r in rows];
+            all_cold = [r["speedup_cold"] or 0.0 for r in rows];
+            n        = len(rows);
+            avg_warm = round(sum(all_warm) / n, 2);
+            avg_cold = round(sum(all_cold) / n, 2);
+            wins     = len([x for x in all_warm if x >= 1.1]);
+            losses   = len([x for x in all_warm if x < 0.9]);
+            # Use reduce (not max(list)) — max(list) compiles to Math.max(array) in JS → NaN
+            best_warm  = all_warm[0];
+            worst_warm = all_warm[0];
+            best_cold  = all_cold[0];
+            for x in all_warm { best_warm  = max(best_warm,  x); }
+            for x in all_warm { worst_warm = min(worst_warm, x); }
+            for x in all_cold { best_cold  = max(best_cold,  x); }
+
+            fo_groups: dict = {};
+            for r in rows {
+                k = str(r[group_key] or "?");
+                if k not in fo_groups { fo_groups[k] = []; }
+                fo_groups[k] = fo_groups[k] + [r["speedup_warm"] or 0.0];
+            }
+            sel_groups: dict = {};
+            for r in rows {
+                k = f"{int((r['selectivity'] or 0.0) * 100)}%";
+                if k not in sel_groups { sel_groups[k] = []; }
+                sel_groups[k] = sel_groups[k] + [r["speedup_warm"] or 0.0];
+            }
+
+            def cellBg(avg: float) -> str {
+                if avg >= 1.3   { return "#d1fae5"; }
+                elif avg >= 1.1 { return "#ccfbf1"; }
+                elif avg >= 0.9 { return "#f1f5f9"; }
+                else            { return "#fee2e2"; }
+            }
+            def cellCol(avg: float) -> str {
+                return "#065f46" if avg >= 1.0 else "#dc2626";
+            }
+
+            return
+                <div style={{"background": "#f8fafc", "border": "1px solid #e2e8f0", "borderRadius": "8px", "padding": "18px", "marginTop": "20px"}}>
+                    <h3 style={{"margin": "0 0 14px 0", "fontSize": "13px", "fontWeight": "700", "color": "#1e293b"}}>{f"Aggregated Summary — {n} runs"}</h3>
+                    <div style={{"display": "flex", "gap": "28px", "flexWrap": "wrap", "paddingBottom": "14px", "marginBottom": "14px", "borderBottom": "1px solid #e2e8f0"}}>
+                        <div style={{"textAlign": "center"}}>
+                            <div style={{"fontSize": "10px", "color": "#64748b", "textTransform": "uppercase", "fontWeight": "600", "marginBottom": "3px"}}>Avg warm speedup</div>
+                            <div style={{"fontSize": "22px", "fontWeight": "800", "color": cellCol(avg_warm)}}>{avg_warm}×</div>
+                            <div style={{"fontSize": "9px", "color": "#94a3b8"}}>steady-state (AM hit)</div>
+                        </div>
+                        <div style={{"textAlign": "center"}}>
+                            <div style={{"fontSize": "10px", "color": "#64748b", "textTransform": "uppercase", "fontWeight": "600", "marginBottom": "3px"}}>Avg cold speedup</div>
+                            <div style={{"fontSize": "22px", "fontWeight": "800", "color": cellCol(avg_cold)}}>{avg_cold}×</div>
+                            <div style={{"fontSize": "9px", "color": "#94a3b8"}}>AM-miss path (GT SQL)</div>
+                        </div>
+                        <div style={{"textAlign": "center"}}>
+                            <div style={{"fontSize": "10px", "color": "#64748b", "textTransform": "uppercase", "fontWeight": "600", "marginBottom": "3px"}}>Best warm</div>
+                            <div style={{"fontSize": "22px", "fontWeight": "800", "color": "#065f46"}}>{best_warm}×</div>
+                        </div>
+                        <div style={{"textAlign": "center"}}>
+                            <div style={{"fontSize": "10px", "color": "#64748b", "textTransform": "uppercase", "fontWeight": "600", "marginBottom": "3px"}}>Worst warm</div>
+                            <div style={{"fontSize": "22px", "fontWeight": "800", "color": ("#dc2626" if worst_warm < 1.0 else "#64748b")}}>{worst_warm}×</div>
+                        </div>
+                        <div style={{"textAlign": "center"}}>
+                            <div style={{"fontSize": "10px", "color": "#64748b", "textTransform": "uppercase", "fontWeight": "600", "marginBottom": "3px"}}>Index wins / losses</div>
+                            <div style={{"fontSize": "20px", "fontWeight": "800"}}>
+                                <span style={{"color": "#065f46"}}>{wins}</span>
+                                <span style={{"color": "#94a3b8"}}> / </span>
+                                <span style={{"color": "#dc2626"}}>{losses}</span>
+                            </div>
+                            <div style={{"fontSize": "9px", "color": "#94a3b8"}}>of {n} runs</div>
+                        </div>
+                    </div>
+                    {(len(fo_groups) > 1 and
+                        <div style={{"marginBottom": "14px"}}>
+                            <div style={{"fontSize": "10px", "color": "#64748b", "textTransform": "uppercase", "fontWeight": "600", "marginBottom": "8px"}}>Warm speedup by {group_key} (avg over runs)</div>
+                            <div style={{"display": "flex", "gap": "8px", "flexWrap": "wrap"}}>
+                                {[
+                                    <div key={k} style={{"background": cellBg(sum(vs)/len(vs)), "border": "1px solid #e2e8f0", "borderRadius": "6px", "padding": "8px 14px", "textAlign": "center", "minWidth": "72px"}}>
+                                        <div style={{"fontSize": "10px", "color": "#64748b", "marginBottom": "2px"}}>{group_key}={k}</div>
+                                        <div style={{"fontSize": "15px", "fontWeight": "700", "color": cellCol(sum(vs)/len(vs))}}>{round(sum(vs)/len(vs), 2)}×</div>
+                                        <div style={{"fontSize": "9px", "color": "#94a3b8"}}>{len(vs)} run(s)</div>
+                                    </div>
+                                    for (k, vs) in fo_groups.items()
+                                ]}
+                            </div>
+                        </div>
+                    )}
+                    {(len(sel_groups) > 1 and
+                        <div>
+                            <div style={{"fontSize": "10px", "color": "#64748b", "textTransform": "uppercase", "fontWeight": "600", "marginBottom": "8px"}}>Warm speedup by selectivity (avg over runs)</div>
+                            <div style={{"display": "flex", "gap": "8px", "flexWrap": "wrap"}}>
+                                {[
+                                    <div key={k} style={{"background": cellBg(sum(vs)/len(vs)), "border": "1px solid #e2e8f0", "borderRadius": "6px", "padding": "8px 14px", "textAlign": "center", "minWidth": "72px"}}>
+                                        <div style={{"fontSize": "10px", "color": "#64748b", "marginBottom": "2px"}}>sel={k}</div>
+                                        <div style={{"fontSize": "15px", "fontWeight": "700", "color": cellCol(sum(vs)/len(vs))}}>{round(sum(vs)/len(vs), 2)}×</div>
+                                        <div style={{"fontSize": "9px", "color": "#94a3b8"}}>{len(vs)} run(s)</div>
+                                    </div>
+                                    for (k, vs) in sel_groups.items()
+                                ]}
+                            </div>
+                        </div>
+                    )}
+                </div>;
+        }
+
         return
             <div style={{"fontFamily": "system-ui, -apple-system, sans-serif", "minHeight": "100vh", "background": "#f8fafc"}}>
+
                 <div style={{"background": "#1e293b", "color": "#f1f5f9", "padding": "16px 32px"}}>
-                    <h1 style={{"margin": "0", "fontSize": "1.2rem", "fontWeight": "700"}}>Graph Query Benchmark</h1>
+                    <h1 style={{"margin": "0", "fontSize": "1.2rem", "fontWeight": "700"}}>Graph Index Benchmark</h1>
                     <p style={{"margin": "4px 0 0 0", "fontSize": "13px", "color": "#94a3b8"}}>
-                        Local walker traversal vs GT topology index vs AM in-memory matrix — four scenarios
+                        Direct runtime benchmark — <code>JAC_INDEX_ENABLED</code> OFF vs ON cold vs ON warm · no simulation
                     </p>
                 </div>
 
-                <div style={{"background": "#fff", "borderBottom": "1px solid #e2e8f0", "paddingLeft": "32px", "display": "flex"}}>
-                    <button style={tabStyle(activeTab == "singlehop")} onClick={lambda _: Any -> None { activeTab = "singlehop";}}>Single-hop</button>
+                <div style={{"background": "#fff", "borderBottom": "1px solid #e2e8f0", "paddingLeft": "32px", "display": "flex", "alignItems": "center"}}>
+                    <button style={tabStyle(activeTab == "singlehop")}  onClick={lambda _: Any -> None { activeTab = "singlehop";}}>Single-hop</button>
                     <button style={tabStyle(activeTab == "inheritance")} onClick={lambda _: Any -> None { activeTab = "inheritance";}}>Inheritance</button>
-                    <button style={tabStyle(activeTab == "multihop")} onClick={lambda _: Any -> None { activeTab = "multihop";}}>Multi-hop</button>
-                    <button style={tabStyle(activeTab == "arbitrary")} onClick={lambda _: Any -> None { activeTab = "arbitrary";}}>Arbitrary Start</button>
+                    <button style={tabStyle(activeTab == "multihop")}   onClick={lambda _: Any -> None { activeTab = "multihop";}}>Multi-hop</button>
                     <button
                         onClick={handleClear}
-                        style={{"marginLeft": "auto", "marginRight": "16px", "padding": "8px 14px", "background": "#ef4444", "color": "#fff", "border": "none", "borderRadius": "6px", "cursor": "pointer", "fontSize": "13px", "alignSelf": "center"}}
+                        style={{"marginLeft": "auto", "marginRight": "24px", "padding": "7px 14px", "background": "#ef4444", "color": "#fff", "border": "none", "borderRadius": "6px", "cursor": "pointer", "fontSize": "13px"}}
                     >Clear All</button>
                 </div>
 
-                <div style={{"maxWidth": "1100px", "margin": "0 auto", "padding": "28px 24px"}}>
+                <div style={{"maxWidth": "1140px", "margin": "0 auto", "padding": "28px 24px"}}>
 
                     {(activeTab == "singlehop" and
                         <div>
                             <div style={{"background": "#fff", "border": "1px solid #e2e8f0", "borderRadius": "10px", "padding": "22px", "marginBottom": "24px"}}>
-                                <h2 style={{"margin": "0 0 6px 0", "fontSize": "15px", "fontWeight": "700", "color": "#1e293b"}}>Single-hop</h2>
+                                <h2 style={{"margin": "0 0 4px 0", "fontSize": "15px", "fontWeight": "700", "color": "#1e293b"}}>Single-hop</h2>
                                 <p style={{"margin": "0 0 18px 0", "fontSize": "12px", "color": "#64748b"}}>
-                                    root → [TargetNode | OtherNode].  Query: <code>[here--&gt;(?:TargetNode)]</code>
+                                    Graph: BenchRoot → [TargetNode | OtherNode].
+                                    Query: <code>[bench--&gt;(?:TargetNode)]</code>
                                 </p>
+
+                                <div style={{"background": "#f0f9ff", "border": "1px solid #bae6fd", "borderRadius": "6px", "padding": "12px 14px", "marginBottom": "18px", "fontSize": "12px", "color": "#0369a1", "lineHeight": "2.0"}}>
+                                    <div><span style={{"background": "#8b5cf6", "color": "#fff", "borderRadius": "4px", "padding": "1px 7px", "fontWeight": "700", "marginRight": "6px"}}>OFF</span> <code>JAC_INDEX_ENABLED=false</code> — walks the full edge list, loads all {fanOut} neighbor stubs from SQLite, then filters in Python. Cost scales with total fan-out regardless of selectivity.</div>
+                                    <div><span style={{"background": "#f59e0b", "color": "#fff", "borderRadius": "4px", "padding": "1px 7px", "fontWeight": "700", "marginRight": "6px"}}>ON cold</span> AM dict evicted before each iteration — AM miss triggers 1 GT SQL <code>SELECT WHERE type=TargetNode</code>, result warms AM. Avg of N−1 cold runs (first discarded). Higher overhead than OFF when fan-out is moderate and the SQL query cost dominates the savings.</div>
+                                    <div><span style={{"background": "#10b981", "color": "#fff", "borderRadius": "4px", "padding": "1px 7px", "fontWeight": "700", "marginRight": "6px"}}>ON warm</span> AM already populated — direct dict lookup returns {int(fanOut * selectivity)} matching IDs, then bulk-fetch only those nodes. L1 cleared each iteration so node fetches still go to SQLite. <strong>This is the steady-state server path.</strong></div>
+                                </div>
+
                                 <div style={{"display": "flex", "gap": "24px", "flexWrap": "wrap", "alignItems": "flex-end"}}>
                                     <div>
                                         <label style={labelStyle}>Fan Out</label>
@@ -1123,50 +911,72 @@ cl {
                                         </select>
                                     </div>
                                     <div style={{"display": "flex", "gap": "8px"}}>
-                                        <button onClick={handleSeed} disabled={seeding or loading} style={btnStyle("#0ea5e9")}>
-                                            {("Seeding..." if seeding else "1. Seed")}
+                                        <button onClick={handleBenchSingleHop} disabled={shLoading or runningAll} style={btnStyle("#8b5cf6")}>
+                                            {("Running..." if shLoading and not runningAll else "Run Benchmark")}
                                         </button>
-                                        <button onClick={handleBenchmark} disabled={loading or seeding} style={btnStyle("#8b5cf6")}>
-                                            {("Running..." if loading else "2. Benchmark")}
-                                        </button>
-                                        <button onClick={handleRunAll} disabled={loading or seeding or runningAll} style={btnStyle("#0d9488")}>
-                                            {("Running all..." if runningAll else "3. Run All Scenarios")}
+                                        <button onClick={handleRunAll} disabled={shLoading or runningAll} style={btnStyle("#0d9488")}>
+                                            {("Running grid..." if runningAll else "Run Full Grid")}
                                         </button>
                                     </div>
                                 </div>
-                                {(status and <p style={{"margin": "14px 0 0 0", "color": "#0f766e", "fontSize": "13px"}}>{status}</p>)}
-                                {(error and <p style={{"margin": "14px 0 0 0", "color": "#dc2626", "fontSize": "13px"}}>Error: {error}</p>)}
+                                {(shStatus and <p style={{"margin": "14px 0 0 0", "color": "#0f766e", "fontSize": "13px"}}>{shStatus}</p>)}
+                                {(shError  and <p style={{"margin": "14px 0 0 0", "color": "#dc2626", "fontSize": "13px"}}>Error: {shError}</p>)}
                             </div>
 
-                            {(len(results) > 0 and
+                            {(len(shResults) > 0 and
                                 <div style={{"background": "#fff", "border": "1px solid #e2e8f0", "borderRadius": "10px", "padding": "22px", "marginBottom": "24px"}}>
                                     <h2 style={{"margin": "0 0 18px 0", "fontSize": "15px", "fontWeight": "700"}}>Results</h2>
                                     {[
-                                        <div key={i} style={{"marginBottom": "16px"}}>
-                                            <div style={{"fontSize": "12px", "color": "#64748b", "marginBottom": "6px", "fontWeight": "600"}}>
-                                                {f"fan={r['fan_out']} sel={int(r['selectivity']*100)}% iter={r['iterations']}"}
+                                        <div key={i} style={{"marginBottom": "20px", "paddingBottom": "16px", "borderBottom": "1px solid #f1f5f9"}}>
+                                            <div style={{"display": "flex", "alignItems": "center", "flexWrap": "wrap", "gap": "6px", "marginBottom": "5px"}}>
+                                                <span style={{"fontSize": "12px", "color": "#374151", "fontWeight": "700"}}>{f"fan={r['fan_out'] or '?'}  sel={int((r['selectivity'] or 0)*100)}%  iter={r['iterations'] or '?'}  results={r['n_results'] or '?'}"}</span>
+                                                {interpBadge({"sp": r["speedup_warm"] or 0.0})}
+                                                {(r["cold_stats"] and
+                                                    <span style={{"display": "flex", "gap": "4px", "marginLeft": "4px"}}>
+                                                        {statsPill({"label": "AM hits",   "val": r["cold_stats"]["am_hits"]   or 0, "color": "#0d9488"})}
+                                                        {statsPill({"label": "AM misses", "val": r["cold_stats"]["am_misses"] or 0, "color": "#f59e0b"})}
+                                                        {statsPill({"label": "GT hits",   "val": r["cold_stats"]["gt_hits"]   or 0, "color": "#0369a1"})}
+                                                    </span>
+                                                )}
                                             </div>
-                                            {barRow("Local", "#8b5cf6", r["local_latency_ms"], max(r["local_latency_ms"], r["gt_latency_ms"], r["am_latency_ms"]), "local")}
-                                            {barRow("GT",    "#0ea5e9", r["gt_latency_ms"],    max(r["local_latency_ms"], r["gt_latency_ms"], r["am_latency_ms"]), "gt")}
-                                            {barRow("AM",    "#10b981", r["am_latency_ms"],    max(r["local_latency_ms"], r["gt_latency_ms"], r["am_latency_ms"]), "am")}
+                                            <div style={{"fontSize": "10px", "color": "#94a3b8", "marginBottom": "8px", "lineHeight": "1.6"}}>
+                                                <span style={{"color": "#8b5cf6", "fontWeight": "600"}}>OFF</span>: loads all {r["fan_out"] or "?"} neighbors → filter {r["n_results"] or "?"} in Python &nbsp;·&nbsp;
+                                                <span style={{"color": "#f59e0b", "fontWeight": "600"}}>ON cold</span>: AM miss → 1 GT SQL query ({r["cold_stats"]["gt_hits"] or 0 if r["cold_stats"] else 0} GT hit(s)) → warms AM &nbsp;·&nbsp;
+                                                <span style={{"color": "#10b981", "fontWeight": "600"}}>ON warm</span>: AM dict hit → fetch only {r["n_results"] or "?"} matching nodes (skips {(r["fan_out"] or 0) - (r["n_results"] or 0)} unnecessary loads)
+                                            </div>
+                                            {barRow({"label": "OFF",     "color": "#8b5cf6", "val": r["off_avg_ms"],     "maxVal": max(r["off_avg_ms"], r["on_cold_ms"], r["on_warm_avg_ms"])})}
+                                            {barRow({"label": "ON cold", "color": "#f59e0b", "val": r["on_cold_ms"],     "maxVal": max(r["off_avg_ms"], r["on_cold_ms"], r["on_warm_avg_ms"])})}
+                                            {barRow({"label": "ON warm", "color": "#10b981", "val": r["on_warm_avg_ms"], "maxVal": max(r["off_avg_ms"], r["on_cold_ms"], r["on_warm_avg_ms"])})}
+                                            <div style={{"marginTop": "6px", "fontSize": "11px", "color": "#64748b"}}>
+                                                {f"Warm {r['speedup_warm']}× · Cold {r['speedup_cold']}×  —  {'' if (r['speedup_warm'] or 0) >= 1.0 else 'index adds overhead at this fan/selectivity; '}{'index saves ' + str((r['fan_out'] or 0) - (r['n_results'] or 0)) + ' node fetches per warm query' if (r['speedup_warm'] or 0) >= 1.0 else ''}"}
+                                            </div>
                                         </div>
-                                        for (i, r) in enumerate(results)
+                                        for (i, r) in enumerate(shResults)
                                     ]}
-                                    {resultsTable(results)}
+                                    {resultsTable({"rows": shResults})}
+                                    {summaryPanel({"rows": shResults, "group_key": "fan_out"})}
                                 </div>
                             )}
 
                             {(showHeatmap and
                                 <div style={{"background": "#fff", "border": "1px solid #e2e8f0", "borderRadius": "10px", "padding": "22px"}}>
-                                    <h2 style={{"margin": "0 0 6px 0", "fontSize": "15px", "fontWeight": "700"}}>Speedup Heatmap</h2>
-                                    <p style={{"margin": "0 0 16px 0", "fontSize": "12px", "color": "#64748b"}}>GT / AM speedup vs local. Color = AM speedup magnitude.</p>
+                                    <h2 style={{"margin": "0 0 4px 0", "fontSize": "15px", "fontWeight": "700"}}>Speedup Heatmap — ON warm vs OFF</h2>
+                                    <p style={{"margin": "0 0 8px 0", "fontSize": "12px", "color": "#64748b"}}>
+                                        Each cell shows <span style={{"color": "#0369a1", "fontWeight": "600"}}>cold speedup</span> (top) and <span style={{"color": "#065f46", "fontWeight": "600"}}>warm speedup</span> (bottom). Cell color reflects warm speedup only — this is the steady-state production path.
+                                    </p>
+                                    <div style={{"display": "flex", "gap": "8px", "marginBottom": "14px", "flexWrap": "wrap", "fontSize": "11px"}}>
+                                        <span style={{"background": "#d1fae5", "padding": "2px 10px", "borderRadius": "4px", "fontWeight": "600", "color": "#065f46"}}>≥ 1.3× Strong win</span>
+                                        <span style={{"background": "#ccfbf1", "padding": "2px 10px", "borderRadius": "4px", "fontWeight": "600", "color": "#0f766e"}}>≥ 1.1× Moderate win</span>
+                                        <span style={{"background": "#f1f5f9", "padding": "2px 10px", "borderRadius": "4px", "fontWeight": "600", "color": "#475569"}}>≥ 0.9× Roughly equal</span>
+                                        <span style={{"background": "#fee2e2", "padding": "2px 10px", "borderRadius": "4px", "fontWeight": "600", "color": "#991b1b"}}>&lt; 0.9× Index slower</span>
+                                    </div>
                                     <div style={{"overflowX": "auto"}}>
-                                        <table style={{"borderCollapse": "collapse", "fontSize": "12px", "width": "100%"}}>
+                                        <table style={{"borderCollapse": "collapse", "fontSize": "12px"}}>
                                             <thead>
                                                 <tr>
-                                                    <th style={{"padding": "8px 12px", "background": "#f8fafc", "border": "1px solid #e2e8f0", "fontWeight": "700"}}>Selectivity</th>
+                                                    <th style={{"padding": "8px 14px", "background": "#f8fafc", "border": "1px solid #e2e8f0", "fontWeight": "700"}}>Selectivity</th>
                                                     {[
-                                                        <th key={fo} style={{"padding": "8px 12px", "background": "#f8fafc", "border": "1px solid #e2e8f0", "fontWeight": "700", "textAlign": "center"}}>{f"fan={fo}"}</th>
+                                                        <th key={fo} style={{"padding": "8px 14px", "background": "#f8fafc", "border": "1px solid #e2e8f0", "fontWeight": "700", "textAlign": "center"}}>{f"fan={fo}"}</th>
                                                         for fo in [5, 50, 200, 500]
                                                     ]}
                                                 </tr>
@@ -1174,21 +984,21 @@ cl {
                                             <tbody>
                                                 {[
                                                     <tr key={sel_pct}>
-                                                        <td style={{"padding": "8px 12px", "border": "1px solid #e2e8f0", "fontWeight": "600"}}>{f"{sel_pct}% match"}</td>
+                                                        <td style={{"padding": "8px 14px", "border": "1px solid #e2e8f0", "fontWeight": "600"}}>{f"{sel_pct}% match"}</td>
                                                         {[
-                                                            <td key={fo} style={{"padding": "8px 12px", "border": "1px solid #e2e8f0", "textAlign": "center",
+                                                            <td key={fo} style={{"padding": "8px 14px", "border": "1px solid #e2e8f0", "textAlign": "center",
                                                                 "background": (
-                                                                    "#14532d" if (heatmap.get(str(sel_pct), {}).get(str(fo), {}).get("speedup_am", 0) > 100) else
-                                                                    ("#22c55e" if (heatmap.get(str(sel_pct), {}).get(str(fo), {}).get("speedup_am", 0) > 20) else
-                                                                    ("#86efac" if (heatmap.get(str(sel_pct), {}).get(str(fo), {}).get("speedup_am", 0) > 5) else
-                                                                    ("#fde68a" if (heatmap.get(str(sel_pct), {}).get(str(fo), {}).get("speedup_am", 0) > 2) else
-                                                                    "#f8fafc"))))}}>
+                                                                    "#d1fae5" if (shHeatmap[str(sel_pct)] and shHeatmap[str(sel_pct)][str(fo)] and shHeatmap[str(sel_pct)][str(fo)]["speedup_warm"] >= 1.3) else
+                                                                    "#ccfbf1" if (shHeatmap[str(sel_pct)] and shHeatmap[str(sel_pct)][str(fo)] and shHeatmap[str(sel_pct)][str(fo)]["speedup_warm"] >= 1.1) else
+                                                                    "#fee2e2" if (shHeatmap[str(sel_pct)] and shHeatmap[str(sel_pct)][str(fo)] and shHeatmap[str(sel_pct)][str(fo)]["speedup_warm"] < 0.9) else
+                                                                    "#f1f5f9"
+                                                                )}}>
                                                                 {(
                                                                     <div>
-                                                                        <div style={{"fontWeight": "700", "color": "#0369a1"}}>{f"GT {heatmap[str(sel_pct)][str(fo)]['speedup_gt']}x"}</div>
-                                                                        <div style={{"fontWeight": "700", "color": "#065f46"}}>{f"AM {heatmap[str(sel_pct)][str(fo)]['speedup_am']}x"}</div>
+                                                                        <div style={{"fontWeight": "600", "color": "#0369a1", "fontSize": "10px", "marginBottom": "1px"}}>cold: {str(shHeatmap[str(sel_pct)][str(fo)]["speedup_cold"]) + "×"}</div>
+                                                                        <div style={{"fontWeight": "800", "color": "#065f46", "fontSize": "13px"}}>warm: {str(shHeatmap[str(sel_pct)][str(fo)]["speedup_warm"]) + "×"}</div>
                                                                     </div>
-                                                                    if (heatmap.get(str(sel_pct), {}).get(str(fo)))
+                                                                    if (shHeatmap[str(sel_pct)] and shHeatmap[str(sel_pct)][str(fo)])
                                                                     else <span style={{"color": "#94a3b8"}}>—</span>
                                                                 )}
                                                             </td>
@@ -1208,70 +1018,86 @@ cl {
                     {(activeTab == "inheritance" and
                         <div>
                             <div style={{"background": "#fff", "border": "1px solid #e2e8f0", "borderRadius": "10px", "padding": "22px", "marginBottom": "24px"}}>
-                                <h2 style={{"margin": "0 0 6px 0", "fontSize": "15px", "fontWeight": "700", "color": "#1e293b"}}>Inheritance</h2>
+                                <h2 style={{"margin": "0 0 4px 0", "fontSize": "15px", "fontWeight": "700", "color": "#1e293b"}}>Inheritance (MRO fan-out)</h2>
                                 <p style={{"margin": "0 0 18px 0", "fontSize": "12px", "color": "#64748b"}}>
-                                    root → [PostNode | CommentNode | OtherNode].  Query: <code>[here--&gt;(?:BaseContent)]</code> returns PostNode + CommentNode via MRO fan-out indexing.
-                                    GT/AM pre-index each subclass node under all ancestor type buckets at write time.
+                                    Graph: BenchRoot → [PostNode | CommentNode | OtherNode].
+                                    Query: <code>[bench--&gt;(?:BaseContent)]</code> — returns PostNode + CommentNode via MRO.
+                                    At <code>++&gt;</code> time, am_put indexes each node under every ancestor type, so "BaseContent" bucket already contains both subtypes.
                                 </p>
+
+                                <div style={{"background": "#f0fdf4", "border": "1px solid #bbf7d0", "borderRadius": "6px", "padding": "12px 14px", "marginBottom": "18px", "fontSize": "12px", "color": "#065f46", "lineHeight": "2.0"}}>
+                                    <div><span style={{"background": "#8b5cf6", "color": "#fff", "borderRadius": "4px", "padding": "1px 7px", "fontWeight": "700", "marginRight": "6px"}}>OFF</span> Loads all {inhFanOut} neighbors, then filters with <code>isinstance(node, BaseContent)</code> in Python — pays for every OtherNode fetch even though they're discarded.</div>
+                                    <div><span style={{"background": "#f59e0b", "color": "#fff", "borderRadius": "4px", "padding": "1px 7px", "fontWeight": "700", "marginRight": "6px"}}>ON cold</span> AM evicted → 1 GT SQL query on "BaseContent" bucket (resolves PostNode + CommentNode IDs via MRO fan-out at <code>++&gt;</code> time). Avg of N−1 cold runs.</div>
+                                    <div><span style={{"background": "#10b981", "color": "#fff", "borderRadius": "4px", "padding": "1px 7px", "fontWeight": "700", "marginRight": "6px"}}>ON warm</span> "BaseContent" AM dict hit → fetch only {int(inhFanOut * inhSel)} matching nodes (Post + Comment). OtherNodes never loaded. <strong>MRO fan-out is the key advantage here.</strong></div>
+                                </div>
+
                                 <div style={{"display": "flex", "gap": "24px", "flexWrap": "wrap", "alignItems": "flex-end"}}>
                                     <div>
                                         <label style={labelStyle}>Fan Out (total nodes)</label>
-                                        <select value={inheritFanOut} onChange={lambda e: Any -> None { inheritFanOut = int(e.target.value);}} style={selectStyle}>
-                                            <option value={10}>10 nodes</option>
+                                        <select value={inhFanOut} onChange={lambda e: Any -> None { inhFanOut = int(e.target.value);}} style={selectStyle}>
+                                            <option value={20}>20 nodes</option>
                                             <option value={50}>50 nodes</option>
                                             <option value={200}>200 nodes</option>
                                             <option value={500}>500 nodes</option>
                                         </select>
                                     </div>
                                     <div>
-                                        <label style={labelStyle}>BaseContent fraction</label>
-                                        <select value={inheritSelectivity} onChange={lambda e: Any -> None { inheritSelectivity = float(e.target.value);}} style={selectStyle}>
-                                            <option value={0.2}>20% (PostNode+CommentNode)</option>
-                                            <option value={0.4}>40%</option>
-                                            <option value={0.6}>60%</option>
+                                        <label style={labelStyle}>BaseContent fraction (Post+Comment)</label>
+                                        <select value={inhSel} onChange={lambda e: Any -> None { inhSel = float(e.target.value);}} style={selectStyle}>
+                                            <option value={0.2}>20%</option>
+                                            <option value={0.32}>32%</option>
+                                            <option value={0.5}>50%</option>
                                             <option value={0.8}>80%</option>
                                         </select>
                                     </div>
                                     <div>
                                         <label style={labelStyle}>Iterations</label>
-                                        <select value={inheritIters} onChange={lambda e: Any -> None { inheritIters = int(e.target.value);}} style={selectStyle}>
+                                        <select value={inhIters} onChange={lambda e: Any -> None { inhIters = int(e.target.value);}} style={selectStyle}>
                                             <option value={1}>1</option>
                                             <option value={5}>5</option>
                                             <option value={10}>10</option>
                                         </select>
                                     </div>
-                                    <div style={{"display": "flex", "gap": "8px"}}>
-                                        <button onClick={handleSeedInheritance} disabled={inheritSeeding or inheritBenching} style={btnStyle("#0ea5e9")}>
-                                            {("Seeding..." if inheritSeeding else "1. Seed")}
-                                        </button>
-                                        <button onClick={handleBenchInheritance} disabled={inheritBenching or inheritSeeding} style={btnStyle("#8b5cf6")}>
-                                            {("Running..." if inheritBenching else "2. Benchmark")}
-                                        </button>
-                                    </div>
+                                    <button onClick={handleBenchInheritance} disabled={inhLoading} style={btnStyle("#8b5cf6")}>
+                                        {("Running..." if inhLoading else "Run Benchmark")}
+                                    </button>
                                 </div>
-                                {(inheritStatus and <p style={{"margin": "14px 0 0 0", "color": "#0f766e", "fontSize": "13px"}}>{inheritStatus}</p>)}
-                                {(inheritError and <p style={{"margin": "14px 0 0 0", "color": "#dc2626", "fontSize": "13px"}}>Error: {inheritError}</p>)}
-                                <div style={{"marginTop": "14px", "padding": "12px", "background": "#f8fafc", "borderRadius": "6px", "fontSize": "12px", "color": "#64748b", "lineHeight": "1.6"}}>
-                                    <strong>Local:</strong> loads all {inheritFanOut} neighbors, filters by isinstance(node, BaseContent) — touches OtherNode too.
-                                    &nbsp;&nbsp;
-                                    <strong>GT/AM:</strong> looks up "BaseContent" bucket = PostNode + CommentNode IDs (pre-resolved at write via MRO) → fetches only {int(inheritFanOut * inheritSelectivity)} nodes.
-                                </div>
+                                {(inhStatus and <p style={{"margin": "14px 0 0 0", "color": "#0f766e", "fontSize": "13px"}}>{inhStatus}</p>)}
+                                {(inhError  and <p style={{"margin": "14px 0 0 0", "color": "#dc2626", "fontSize": "13px"}}>Error: {inhError}</p>)}
                             </div>
-                            {(len(inheritResults) > 0 and
+
+                            {(len(inhResults) > 0 and
                                 <div style={{"background": "#fff", "border": "1px solid #e2e8f0", "borderRadius": "10px", "padding": "22px"}}>
                                     <h2 style={{"margin": "0 0 18px 0", "fontSize": "15px", "fontWeight": "700"}}>Results</h2>
                                     {[
-                                        <div key={i} style={{"marginBottom": "16px"}}>
-                                            <div style={{"fontSize": "12px", "color": "#64748b", "marginBottom": "6px", "fontWeight": "600"}}>
-                                                {f"fan={r['fan_out']} BaseContent={int(r['selectivity']*100)}% iter={r['iterations']}"}
+                                        <div key={i} style={{"marginBottom": "20px", "paddingBottom": "16px", "borderBottom": "1px solid #f1f5f9"}}>
+                                            <div style={{"display": "flex", "alignItems": "center", "flexWrap": "wrap", "gap": "6px", "marginBottom": "5px"}}>
+                                                <span style={{"fontSize": "12px", "color": "#374151", "fontWeight": "700"}}>{f"fan={r['fan_out'] or '?'}  BaseContent={int((r['selectivity'] or 0)*100)}%  results={r['n_results'] or '?'}"}</span>
+                                                {interpBadge({"sp": r["speedup_warm"] or 0.0})}
+                                                {(r["cold_stats"] and
+                                                    <span style={{"display": "flex", "gap": "4px", "marginLeft": "4px"}}>
+                                                        {statsPill({"label": "AM hits",   "val": r["cold_stats"]["am_hits"]   or 0, "color": "#0d9488"})}
+                                                        {statsPill({"label": "AM misses", "val": r["cold_stats"]["am_misses"] or 0, "color": "#f59e0b"})}
+                                                        {statsPill({"label": "GT hits",   "val": r["cold_stats"]["gt_hits"]   or 0, "color": "#0369a1"})}
+                                                    </span>
+                                                )}
                                             </div>
-                                            {barRow("Local", "#8b5cf6", r["local_latency_ms"], max(r["local_latency_ms"], r["gt_latency_ms"], r["am_latency_ms"]), "local")}
-                                            {barRow("GT",    "#0ea5e9", r["gt_latency_ms"],    max(r["local_latency_ms"], r["gt_latency_ms"], r["am_latency_ms"]), "gt")}
-                                            {barRow("AM",    "#10b981", r["am_latency_ms"],    max(r["local_latency_ms"], r["gt_latency_ms"], r["am_latency_ms"]), "am")}
+                                            <div style={{"fontSize": "10px", "color": "#94a3b8", "marginBottom": "8px", "lineHeight": "1.6"}}>
+                                                <span style={{"color": "#8b5cf6", "fontWeight": "600"}}>OFF</span>: fetches all {r["fan_out"] or "?"} nodes including OtherNodes, filters by isinstance(BaseContent) &nbsp;·&nbsp;
+                                                <span style={{"color": "#f59e0b", "fontWeight": "600"}}>ON cold</span>: 1 GT SQL on "BaseContent" bucket (MRO-indexed at edge-creation time) &nbsp;·&nbsp;
+                                                <span style={{"color": "#10b981", "fontWeight": "600"}}>ON warm</span>: AM hit → {r["n_results"] or "?"} fetches only (skips {(r["fan_out"] or 0) - (r["n_results"] or 0)} OtherNode loads)
+                                            </div>
+                                            {barRow({"label": "OFF",     "color": "#8b5cf6", "val": r["off_avg_ms"],     "maxVal": max(r["off_avg_ms"], r["on_cold_ms"], r["on_warm_avg_ms"])})}
+                                            {barRow({"label": "ON cold", "color": "#f59e0b", "val": r["on_cold_ms"],     "maxVal": max(r["off_avg_ms"], r["on_cold_ms"], r["on_warm_avg_ms"])})}
+                                            {barRow({"label": "ON warm", "color": "#10b981", "val": r["on_warm_avg_ms"], "maxVal": max(r["off_avg_ms"], r["on_cold_ms"], r["on_warm_avg_ms"])})}
+                                            <div style={{"marginTop": "6px", "fontSize": "11px", "color": "#64748b"}}>
+                                                {f"Warm {r['speedup_warm']}× · Cold {r['speedup_cold']}×  —  MRO fan-out at ++> time is what makes the 'BaseContent' bucket work for both PostNode and CommentNode"}
+                                            </div>
                                         </div>
-                                        for (i, r) in enumerate(inheritResults)
+                                        for (i, r) in enumerate(inhResults)
                                     ]}
-                                    {resultsTable(inheritResults)}
+                                    {resultsTable({"rows": inhResults})}
+                                    {summaryPanel({"rows": inhResults, "group_key": "fan_out"})}
                                 </div>
                             )}
                         </div>
@@ -1280,135 +1106,87 @@ cl {
                     {(activeTab == "multihop" and
                         <div>
                             <div style={{"background": "#fff", "border": "1px solid #e2e8f0", "borderRadius": "10px", "padding": "22px", "marginBottom": "24px"}}>
-                                <h2 style={{"margin": "0 0 6px 0", "fontSize": "15px", "fontWeight": "700", "color": "#1e293b"}}>Multi-hop (2-hop)</h2>
+                                <h2 style={{"margin": "0 0 4px 0", "fontSize": "15px", "fontWeight": "700", "color": "#1e293b"}}>Multi-hop (2-hop)</h2>
                                 <p style={{"margin": "0 0 18px 0", "fontSize": "12px", "color": "#64748b"}}>
-                                    root → MidNode[i] → [TargetNode | OtherNode].  Query: find all TargetNodes reachable from root in 2 hops.
-                                    Local cost: mid_count + mid_count × branch_factor fetches.
-                                    GT/AM cost: 2 index lookups + (mid_count × selectivity × branch_factor) fetches.
+                                    Graph: BenchRoot → MidNode[i] → [TargetNode | OtherNode].
+                                    Query: <code>[bench--&gt;(?:MidNode)]</code> then <code>[mid--&gt;(?:TargetNode)]</code> for each mid.
+                                    OFF cost: {mhMid} mid fetches + {mhMid}×{mhBt+mhBo} child fetches.
+                                    ON warm cost: index resolves mid IDs + {mhMid}×{mhBt} target fetches only.
                                 </p>
+
                                 <div style={{"display": "flex", "gap": "24px", "flexWrap": "wrap", "alignItems": "flex-end"}}>
                                     <div>
                                         <label style={labelStyle}>Mid Count</label>
-                                        <select value={midCount} onChange={lambda e: Any -> None { midCount = int(e.target.value);}} style={selectStyle}>
+                                        <select value={mhMid} onChange={lambda e: Any -> None { mhMid = int(e.target.value);}} style={selectStyle}>
                                             <option value={5}>5</option>
-                                            <option value={10}>10</option>
-                                            <option value={20}>20</option>
-                                            <option value={50}>50</option>
+                                            <option value={15}>15</option>
+                                            <option value={30}>30</option>
                                         </select>
                                     </div>
                                     <div>
-                                        <label style={labelStyle}>Branch Factor (children/mid)</label>
-                                        <select value={branchFactor} onChange={lambda e: Any -> None { branchFactor = int(e.target.value);}} style={selectStyle}>
-                                            <option value={5}>5</option>
+                                        <label style={labelStyle}>Branch TargetNodes / mid</label>
+                                        <select value={mhBt} onChange={lambda e: Any -> None { mhBt = int(e.target.value);}} style={selectStyle}>
+                                            <option value={3}>3</option>
+                                            <option value={6}>6</option>
                                             <option value={10}>10</option>
-                                            <option value={20}>20</option>
-                                            <option value={50}>50</option>
                                         </select>
                                     </div>
                                     <div>
-                                        <label style={labelStyle}>Selectivity (TargetNode %)</label>
-                                        <select value={multihopSel} onChange={lambda e: Any -> None { multihopSel = float(e.target.value);}} style={selectStyle}>
-                                            <option value={0.1}>10%</option>
-                                            <option value={0.3}>30%</option>
-                                            <option value={0.5}>50%</option>
-                                            <option value={0.8}>80%</option>
+                                        <label style={labelStyle}>Branch OtherNodes / mid</label>
+                                        <select value={mhBo} onChange={lambda e: Any -> None { mhBo = int(e.target.value);}} style={selectStyle}>
+                                            <option value={7}>7</option>
+                                            <option value={14}>14</option>
+                                            <option value={20}>20</option>
                                         </select>
                                     </div>
                                     <div>
                                         <label style={labelStyle}>Iterations</label>
-                                        <select value={multihopIters} onChange={lambda e: Any -> None { multihopIters = int(e.target.value);}} style={selectStyle}>
+                                        <select value={mhIters} onChange={lambda e: Any -> None { mhIters = int(e.target.value);}} style={selectStyle}>
                                             <option value={1}>1</option>
                                             <option value={5}>5</option>
                                             <option value={10}>10</option>
                                         </select>
                                     </div>
-                                    <div style={{"display": "flex", "gap": "8px"}}>
-                                        <button onClick={handleSeedMultihop} disabled={multihopSeeding or multihopBenching} style={btnStyle("#0ea5e9")}>
-                                            {("Seeding..." if multihopSeeding else "1. Seed")}
-                                        </button>
-                                        <button onClick={handleBenchMultihop} disabled={multihopBenching or multihopSeeding} style={btnStyle("#8b5cf6")}>
-                                            {("Running..." if multihopBenching else "2. Benchmark")}
-                                        </button>
-                                    </div>
-                                </div>
-                                {(multihopStatus and <p style={{"margin": "14px 0 0 0", "color": "#0f766e", "fontSize": "13px"}}>{multihopStatus}</p>)}
-                                {(multihopError and <p style={{"margin": "14px 0 0 0", "color": "#dc2626", "fontSize": "13px"}}>Error: {multihopError}</p>)}
-                                <div style={{"marginTop": "14px", "padding": "12px", "background": "#f8fafc", "borderRadius": "6px", "fontSize": "12px", "color": "#64748b", "lineHeight": "1.6"}}>
-                                    <strong>Local:</strong> hop1 loads {midCount} MidNodes; hop2 iterates each mid's edges → fetches all {midCount * branchFactor} children → filters.
-                                    &nbsp;&nbsp;
-                                    <strong>GT/AM:</strong> 2 sequential index dict lookups → bulk-fetch only {int(midCount * branchFactor * multihopSel)} TargetNodes.
-                                </div>
-                            </div>
-                            {(len(multihopResults) > 0 and
-                                <div style={{"background": "#fff", "border": "1px solid #e2e8f0", "borderRadius": "10px", "padding": "22px"}}>
-                                    <h2 style={{"margin": "0 0 18px 0", "fontSize": "15px", "fontWeight": "700"}}>Results</h2>
-                                    {[
-                                        <div key={i} style={{"marginBottom": "16px"}}>
-                                            <div style={{"fontSize": "12px", "color": "#64748b", "marginBottom": "6px", "fontWeight": "600"}}>
-                                                {f"mids={r['mid_count']} branch={r['branch_factor']} sel={int(r['selectivity']*100)}% iter={r['iterations']}"}
-                                            </div>
-                                            {barRow("Local", "#8b5cf6", r["local_latency_ms"], max(r["local_latency_ms"], r["gt_latency_ms"], r["am_latency_ms"]), "local")}
-                                            {barRow("GT",    "#0ea5e9", r["gt_latency_ms"],    max(r["local_latency_ms"], r["gt_latency_ms"], r["am_latency_ms"]), "gt")}
-                                            {barRow("AM",    "#10b981", r["am_latency_ms"],    max(r["local_latency_ms"], r["gt_latency_ms"], r["am_latency_ms"]), "am")}
-                                        </div>
-                                        for (i, r) in enumerate(multihopResults)
-                                    ]}
-                                    {resultsTable(multihopResults)}
-                                </div>
-                            )}
-                        </div>
-                    )}
-
-                    {(activeTab == "arbitrary" and
-                        <div>
-                            <div style={{"background": "#fff", "border": "1px solid #e2e8f0", "borderRadius": "10px", "padding": "22px", "marginBottom": "24px"}}>
-                                <h2 style={{"margin": "0 0 6px 0", "fontSize": "15px", "fontWeight": "700", "color": "#1e293b"}}>Arbitrary Start Node</h2>
-                                <p style={{"margin": "0 0 18px 0", "fontSize": "12px", "color": "#64748b"}}>
-                                    Traversal starting from a non-root node (the first MidNode in the multi-hop graph).
-                                    Requires the multi-hop graph to be seeded first.
-                                    Demonstrates that GT and AM indexes are source-agnostic: any node ID can be the lookup key.
-                                </p>
-                                <div style={{"padding": "12px", "background": "#fef3c7", "borderRadius": "6px", "fontSize": "12px", "color": "#92400e", "marginBottom": "16px"}}>
-                                    Prerequisite: seed the multi-hop graph from the Multi-hop tab first.
-                                </div>
-                                <div style={{"display": "flex", "gap": "24px", "flexWrap": "wrap", "alignItems": "flex-end"}}>
-                                    <div>
-                                        <label style={labelStyle}>Iterations</label>
-                                        <select value={arbIters} onChange={lambda e: Any -> None { arbIters = int(e.target.value);}} style={selectStyle}>
-                                            <option value={1}>1</option>
-                                            <option value={5}>5</option>
-                                            <option value={10}>10</option>
-                                        </select>
-                                    </div>
-                                    <button onClick={handleBenchArbitrary} disabled={arbBenching} style={btnStyle("#8b5cf6")}>
-                                        {("Running..." if arbBenching else "Run Benchmark")}
+                                    <button onClick={handleBenchMultihop} disabled={mhLoading} style={btnStyle("#8b5cf6")}>
+                                        {("Running..." if mhLoading else "Run Benchmark")}
                                     </button>
                                 </div>
-                                {(arbStatus and <p style={{"margin": "14px 0 0 0", "color": "#0f766e", "fontSize": "13px"}}>{arbStatus}</p>)}
-                                {(arbError and <p style={{"margin": "14px 0 0 0", "color": "#dc2626", "fontSize": "13px"}}>Error: {arbError}</p>)}
-                                <div style={{"marginTop": "14px", "padding": "12px", "background": "#f8fafc", "borderRadius": "6px", "fontSize": "12px", "color": "#64748b", "lineHeight": "1.6"}}>
-                                    <strong>Local:</strong> fetch MidNode anchor from SQLite, iterate ALL its outgoing edges, load each child, filter by TargetNode type.
-                                    &nbsp;&nbsp;
-                                    <strong>GT:</strong> <code>gt_index[mid_id]["TargetNode"]</code> — lookup by non-root node ID.
-                                    &nbsp;&nbsp;
-                                    <strong>AM:</strong> <code>am_index[mid_id]["TargetNode"]</code> — same, zero I/O.
-                                </div>
+                                {(mhStatus and <p style={{"margin": "14px 0 0 0", "color": "#0f766e", "fontSize": "13px"}}>{mhStatus}</p>)}
+                                {(mhError  and <p style={{"margin": "14px 0 0 0", "color": "#dc2626", "fontSize": "13px"}}>Error: {mhError}</p>)}
                             </div>
-                            {(len(arbResults) > 0 and
+
+                            {(len(mhResults) > 0 and
                                 <div style={{"background": "#fff", "border": "1px solid #e2e8f0", "borderRadius": "10px", "padding": "22px"}}>
                                     <h2 style={{"margin": "0 0 18px 0", "fontSize": "15px", "fontWeight": "700"}}>Results</h2>
                                     {[
-                                        <div key={i} style={{"marginBottom": "16px"}}>
-                                            <div style={{"fontSize": "12px", "color": "#64748b", "marginBottom": "6px", "fontWeight": "600"}}>
-                                                {f"start={r.get('start_node','?')[:8]}… iter={r['iterations']}"}
+                                        <div key={i} style={{"marginBottom": "20px", "paddingBottom": "16px", "borderBottom": "1px solid #f1f5f9"}}>
+                                            <div style={{"display": "flex", "alignItems": "center", "flexWrap": "wrap", "gap": "6px", "marginBottom": "5px"}}>
+                                                <span style={{"fontSize": "12px", "color": "#374151", "fontWeight": "700"}}>{f"mid={r['n_mid'] or '?'}  branch={r['branch_factor'] or '?'}  sel={int((r['selectivity'] or 0)*100)}%  results={r['n_results'] or '?'}"}</span>
+                                                {interpBadge({"sp": r["speedup_warm"] or 0.0})}
+                                                {(r["cold_stats"] and
+                                                    <span style={{"display": "flex", "gap": "4px", "marginLeft": "4px"}}>
+                                                        {statsPill({"label": "AM hits",   "val": r["cold_stats"]["am_hits"]   or 0, "color": "#0d9488"})}
+                                                        {statsPill({"label": "AM misses", "val": r["cold_stats"]["am_misses"] or 0, "color": "#f59e0b"})}
+                                                        {statsPill({"label": "GT hits",   "val": r["cold_stats"]["gt_hits"]   or 0, "color": "#0369a1"})}
+                                                    </span>
+                                                )}
                                             </div>
-                                            {barRow("Local", "#8b5cf6", r["local_latency_ms"], max(r["local_latency_ms"], r["gt_latency_ms"], r["am_latency_ms"]), "local")}
-                                            {barRow("GT",    "#0ea5e9", r["gt_latency_ms"],    max(r["local_latency_ms"], r["gt_latency_ms"], r["am_latency_ms"]), "gt")}
-                                            {barRow("AM",    "#10b981", r["am_latency_ms"],    max(r["local_latency_ms"], r["gt_latency_ms"], r["am_latency_ms"]), "am")}
+                                            <div style={{"fontSize": "10px", "color": "#94a3b8", "marginBottom": "8px", "lineHeight": "1.6"}}>
+                                                <span style={{"color": "#8b5cf6", "fontWeight": "600"}}>OFF</span>: hop1 loads {r["n_mid"] or "?"} MidNodes + hop2 loads all {r["branch_factor"] or "?"} children per mid ({(r["n_mid"] or 0) * (r["branch_factor"] or 0)} total loads), filters in Python &nbsp;·&nbsp;
+                                                <span style={{"color": "#f59e0b", "fontWeight": "600"}}>ON cold</span>: {r["cold_stats"]["am_misses"] or 0 if r["cold_stats"] else 0} AM miss(es) → {r["cold_stats"]["gt_hits"] or 0 if r["cold_stats"] else 0} GT SQL queries (1 per source node) &nbsp;·&nbsp;
+                                                <span style={{"color": "#10b981", "fontWeight": "600"}}>ON warm</span>: index resolves each hop in AM → {r["n_results"] or "?"} target fetches only (avoids {(r["n_mid"] or 0) * ((r["branch_factor"] or 0) - int((r["selectivity"] or 0) * (r["branch_factor"] or 0)))} unnecessary loads)
+                                            </div>
+                                            {barRow({"label": "OFF",     "color": "#8b5cf6", "val": r["off_avg_ms"],     "maxVal": max(r["off_avg_ms"], r["on_cold_ms"], r["on_warm_avg_ms"])})}
+                                            {barRow({"label": "ON cold", "color": "#f59e0b", "val": r["on_cold_ms"],     "maxVal": max(r["off_avg_ms"], r["on_cold_ms"], r["on_warm_avg_ms"])})}
+                                            {barRow({"label": "ON warm", "color": "#10b981", "val": r["on_warm_avg_ms"], "maxVal": max(r["off_avg_ms"], r["on_cold_ms"], r["on_warm_avg_ms"])})}
+                                            <div style={{"marginTop": "6px", "fontSize": "11px", "color": "#64748b"}}>
+                                                {f"Warm {r['speedup_warm']}× · Cold {r['speedup_cold']}×  —  cold overhead scales with n_mid ({r['n_mid'] or '?'} GT queries, one per hop-1 source node)"}
+                                            </div>
                                         </div>
-                                        for (i, r) in enumerate(arbResults)
+                                        for (i, r) in enumerate(mhResults)
                                     ]}
-                                    {resultsTable(arbResults)}
+                                    {resultsTable({"rows": mhResults})}
+                                    {summaryPanel({"rows": mhResults, "group_key": "n_mid"})}
                                 </div>
                             )}
                         </div>
