@@ -1,20 +1,22 @@
 """
 Graph Query Benchmark
 =====================
-Directly benchmarks the AM/GT topology index optimization in the Jaseci runtime
+Directly benchmarks the SAM/GTI topology index optimization in the Jaseci runtime
 by toggling JAC_INDEX_ENABLED between runs on the same graph.
 
-No simulation — uses the real runtime (SqliteMemory topology tables + am_index).
+No simulation — uses the real runtime (SqliteMemory topology tables + sam_gti).
 
 Three paths measured per scenario:
   OFF      JAC_INDEX_ENABLED=false  edge-list loop, load ALL neighbors, filter in memory
-  ON cold  JAC_INDEX_ENABLED=true   first traversal after AM eviction: AM miss → GT → warms AM
-  ON warm  JAC_INDEX_ENABLED=true   subsequent traversals: AM hit → bulk fetch only
+  ON cold  JAC_INDEX_ENABLED=true   first traversal after SAM eviction: SAM miss → GTI → warms SAM
+  ON warm  JAC_INDEX_ENABLED=true   subsequent traversals: SAM hit → bulk fetch only
 
 Scenarios:
   1. Single-hop     root –BenchRoot→ [TargetNode | OtherNode],  query (?:TargetNode)
   2. Inheritance    root –BenchRoot→ [PostNode | CommentNode | OtherNode], query (?:BaseContent)
   3. Multi-hop      root –BenchRoot→ MidNode → [TargetNode | OtherNode],  2-hop query
+  4. Edge filter    root –[FollowEdge|LikeEdge]→ [PostNode | OtherNode],
+                    query edge-only [-[FollowEdge]->] and combined [-[FollowEdge]->(?:PostNode)]
 
 Each walker creates an isolated BenchRoot container, benchmarks, then deletes it,
 so repeated runs do not accumulate stale graph state on root.
@@ -28,9 +30,9 @@ Run:
 import os;
 import from time { perf_counter }
 import from jaclang.jac0core.runtime { JacRuntimeInterface }
-import from jaclang.runtimelib.am_index {
-    am_clear,
-    am_invalidate,
+import from jaclang.runtimelib.sam_gti {
+    sam_clear,
+    sam_invalidate,
     reset_stats,
     _stats
 }
@@ -55,6 +57,10 @@ node CommentNode(BaseContent){ has val: int = 0; }
 
 # Multi-hop intermediate layer
 node MidNode { has val: int = 0; }
+
+# Edge-filter scenario: two distinct edge types to demonstrate e: SAM columns
+edge FollowEdge {}
+edge LikeEdge   {}
 
 # ============================================================================
 # SHARED HELPERS (inline, no import from am_store)
@@ -106,11 +112,11 @@ walker:pub bench_single_hop {
             off_times.append((t1 - t0) * 1000.0);
         }
 
-        # ---- ON cold path: AM miss → GT → warms AM ----
+        # ---- ON cold path: SAM miss → GTI → warms SAM ----
         os.environ["JAC_INDEX_ENABLED"] = "true";
         cold_times: list = [];
         for _ in range(self.iterations) {
-            am_clear();
+            sam_clear();
             reset_stats();
             ctx.mem.__mem__.clear();
             t0 = perf_counter();
@@ -121,7 +127,7 @@ walker:pub bench_single_hop {
         cold_stats  = dict(_stats);
         on_cold_ms  = _avg(cold_times[1:] if len(cold_times) > 1 else cold_times);
 
-        # ---- ON warm path: AM hit ----
+        # ---- ON warm path: SAM hit ----
         on_warm_times: list = [];
         for _ in range(self.iterations) {
             ctx.mem.__mem__.clear();   # evict L1, keep AM warm
@@ -136,7 +142,7 @@ walker:pub bench_single_hop {
         bench_id = bench.__jac__.id;
         for child in [bench-->] { del child; }
         del bench;
-        am_invalidate(bench_id);
+        sam_invalidate(bench_id);
         os.environ["JAC_INDEX_ENABLED"] = "true";
 
         avg_off  = _avg(off_times[1:] if len(off_times) > 1 else off_times);
@@ -204,7 +210,7 @@ walker:pub bench_inheritance {
         os.environ["JAC_INDEX_ENABLED"] = "true";
         cold_times: list = [];
         for _ in range(self.iterations) {
-            am_clear();
+            sam_clear();
             reset_stats();
             ctx.mem.__mem__.clear();
             t0 = perf_counter();
@@ -230,7 +236,7 @@ walker:pub bench_inheritance {
         bench_id = bench.__jac__.id;
         for child in [bench-->] { del child; }
         del bench;
-        am_invalidate(bench_id);
+        sam_invalidate(bench_id);
         os.environ["JAC_INDEX_ENABLED"] = "true";
 
         avg_off  = _avg(off_times[1:] if len(off_times) > 1 else off_times);
@@ -311,7 +317,7 @@ walker:pub bench_multihop {
         os.environ["JAC_INDEX_ENABLED"] = "true";
         cold_times: list = [];
         for _ in range(self.iterations) {
-            am_clear();
+            sam_clear();
             reset_stats();
             ctx.mem.__mem__.clear();
             t0 = perf_counter();
@@ -339,10 +345,10 @@ walker:pub bench_multihop {
             mid_id = mid.__jac__.id;
             for child in [mid-->] { del child; }
             del mid;
-            am_invalidate(mid_id);
+            sam_invalidate(mid_id);
         }
         del bench;
-        am_invalidate(bench_id);
+        sam_invalidate(bench_id);
         os.environ["JAC_INDEX_ENABLED"] = "true";
 
         avg_off  = _avg(off_times[1:] if len(off_times) > 1 else off_times);
@@ -361,6 +367,150 @@ walker:pub bench_multihop {
             "n_results":      len(off_results),
             "cold_stats":     cold_stats,
             "iterations":     self.iterations
+        };
+    }
+}
+
+# ============================================================================
+# SCENARIO 4 — EDGE FILTER
+# Graph:  BenchRoot –[FollowEdge]→ [PostNode × n_follow_post | OtherNode × n_follow_other]
+#                  –[LikeEdge]→   PostNode × n_like_post
+# Queries measured:
+#   A. edge-only:   [-[FollowEdge]->]              → SAM "e:FollowEdge" column
+#   B. combined:    [-[FollowEdge]->(?:PostNode)]  → intersect(sam["e:FollowEdge"], sam["n:PostNode"])
+# OFF: full edge-list loop — iterates all edges, checks isinstance + edge type in Python
+# ON:  SAM resolves each query in O(1) / O(intersection), then bulk-fetches only matches
+# ============================================================================
+
+walker:pub bench_edge_filter {
+    has n_follow_post:  int = 20,   # FollowEdge → PostNode  (matches both queries)
+        n_follow_other: int = 30,   # FollowEdge → OtherNode (matches edge-only, not combined)
+        n_like_post:    int = 50,   # LikeEdge   → PostNode  (matches neither FollowEdge query)
+        iterations:     int = 5;
+
+    can run with Root entry {
+        import os;
+
+        # ---- Build isolated subgraph ----
+        bench = (here ++> BenchRoot())[0];
+        for i in range(self.n_follow_post)  { bench +>: FollowEdge() :+> PostNode(val=i);  }
+        for i in range(self.n_follow_other) { bench +>: FollowEdge() :+> OtherNode(val=i); }
+        for i in range(self.n_like_post)    { bench +>: LikeEdge()   :+> PostNode(val=i);  }
+
+        ctx      = JacRuntimeInterface.get_context();
+        fan_out  = self.n_follow_post + self.n_follow_other + self.n_like_post;
+        n_edge   = self.n_follow_post + self.n_follow_other;  # matches edge-only query
+        n_comb   = self.n_follow_post;                        # matches combined query
+
+        def _run_edge -> list { return [bench ->:FollowEdge:->]; }
+        def _run_comb -> list { return [bench ->:FollowEdge:-> (?:PostNode)]; }
+
+        # ---- OFF: edge-only ----
+        os.environ["JAC_INDEX_ENABLED"] = "false";
+        off_edge_times: list = [];
+        for _ in range(self.iterations) {
+            bench.__jac__.edges = [e.make_stub() for e in bench.__jac__.edges];
+            ctx.mem.__mem__.clear();
+            t0 = perf_counter();
+            _run_edge();
+            t1 = perf_counter();
+            off_edge_times.append((t1 - t0) * 1000.0);
+        }
+
+        # ---- OFF: combined ----
+        off_comb_times: list = [];
+        for _ in range(self.iterations) {
+            bench.__jac__.edges = [e.make_stub() for e in bench.__jac__.edges];
+            ctx.mem.__mem__.clear();
+            t0 = perf_counter();
+            _run_comb();
+            t1 = perf_counter();
+            off_comb_times.append((t1 - t0) * 1000.0);
+        }
+
+        # ---- ON cold: edge-only ----
+        os.environ["JAC_INDEX_ENABLED"] = "true";
+        cold_edge_times: list = [];
+        for _ in range(self.iterations) {
+            sam_clear();
+            reset_stats();
+            ctx.mem.__mem__.clear();
+            t0 = perf_counter();
+            _run_edge();
+            t1 = perf_counter();
+            cold_edge_times.append((t1 - t0) * 1000.0);
+        }
+        cold_edge_stats = dict(_stats);
+
+        # ---- ON cold: combined ----
+        cold_comb_times: list = [];
+        for _ in range(self.iterations) {
+            sam_clear();
+            reset_stats();
+            ctx.mem.__mem__.clear();
+            t0 = perf_counter();
+            _run_comb();
+            t1 = perf_counter();
+            cold_comb_times.append((t1 - t0) * 1000.0);
+        }
+        cold_comb_stats = dict(_stats);
+
+        # ---- ON warm: edge-only (SAM already populated from cold runs) ----
+        warm_edge_times: list = [];
+        for _ in range(self.iterations) {
+            ctx.mem.__mem__.clear();
+            reset_stats();
+            t0 = perf_counter();
+            _run_edge();
+            t1 = perf_counter();
+            warm_edge_times.append((t1 - t0) * 1000.0);
+        }
+
+        # ---- ON warm: combined ----
+        warm_comb_times: list = [];
+        for _ in range(self.iterations) {
+            ctx.mem.__mem__.clear();
+            reset_stats();
+            t0 = perf_counter();
+            _run_comb();
+            t1 = perf_counter();
+            warm_comb_times.append((t1 - t0) * 1000.0);
+        }
+
+        # ---- Cleanup ----
+        bench_id = bench.__jac__.id;
+        for child in [bench-->] { del child; }
+        del bench;
+        sam_invalidate(bench_id);
+        os.environ["JAC_INDEX_ENABLED"] = "true";
+
+        avg_off_edge  = _avg(off_edge_times[1:] if len(off_edge_times) > 1 else off_edge_times);
+        avg_off_comb  = _avg(off_comb_times[1:] if len(off_comb_times) > 1 else off_comb_times);
+        avg_warm_edge = _avg(warm_edge_times[1:] if len(warm_edge_times) > 1 else warm_edge_times);
+        avg_warm_comb = _avg(warm_comb_times[1:] if len(warm_comb_times) > 1 else warm_comb_times);
+        on_cold_edge  = _avg(cold_edge_times[1:] if len(cold_edge_times) > 1 else cold_edge_times);
+        on_cold_comb  = _avg(cold_comb_times[1:] if len(cold_comb_times) > 1 else cold_comb_times);
+
+        report {
+            "scenario":         "edge-filter",
+            "fan_out":          fan_out,
+            "n_follow":         n_edge,
+            "n_combined":       n_comb,
+            # edge-only sub-result
+            "edge_off_ms":      round(avg_off_edge, 3),
+            "edge_cold_ms":     round(on_cold_edge, 3),
+            "edge_warm_ms":     round(avg_warm_edge, 3),
+            "edge_speedup_cold": _speedup(avg_off_edge, on_cold_edge),
+            "edge_speedup_warm": _speedup(avg_off_edge, avg_warm_edge),
+            "edge_cold_stats":  cold_edge_stats,
+            # combined sub-result
+            "comb_off_ms":      round(avg_off_comb, 3),
+            "comb_cold_ms":     round(on_cold_comb, 3),
+            "comb_warm_ms":     round(avg_warm_comb, 3),
+            "comb_speedup_cold": _speedup(avg_off_comb, on_cold_comb),
+            "comb_speedup_warm": _speedup(avg_off_comb, avg_warm_comb),
+            "comb_cold_stats":  cold_comb_stats,
+            "iterations":       self.iterations
         };
     }
 }
@@ -405,7 +555,7 @@ walker:pub run_all_scenarios {
                 os.environ["JAC_INDEX_ENABLED"] = "true";
                 cold_times: list = [];
                 for _ in range(self.iterations) {
-                    am_clear();
+                    sam_clear();
                     reset_stats();
                     ctx.mem.__mem__.clear();
                     t0 = perf_counter();
@@ -430,9 +580,9 @@ walker:pub run_all_scenarios {
                 bench_id = bench.__jac__.id;
                 for child in [bench-->] { del child; }
                 del bench;
-                am_invalidate(bench_id);
+                sam_invalidate(bench_id);
                 os.environ["JAC_INDEX_ENABLED"] = "true";
-                am_clear();
+                sam_clear();
                 ctx.mem.__mem__.clear();
 
                 avg_off  = _avg(off_times[1:] if len(off_times) > 1 else off_times);
@@ -479,13 +629,13 @@ walker:pub clear_graph {
                 mid_id = mid.__jac__.id;
                 for child in [mid-->] { del child; }
                 del mid;
-                am_invalidate(mid_id);
+                sam_invalidate(mid_id);
             }
             for child in [bench-->] { del child; }
             del bench;
-            am_invalidate(bench_id);
+            sam_invalidate(bench_id);
         }
-        am_clear();
+        sam_clear();
         report {"status": "cleared"};
     }
 }
@@ -529,6 +679,16 @@ cl {
             mhStatus: str = "",
             mhError: str = "",
             mhResults: list = [];
+
+        # Edge filter tab
+        has efFollowPost: int = 20,
+            efFollowOther: int = 30,
+            efLikePost: int = 50,
+            efIters: int = 5,
+            efLoading: bool = False,
+            efStatus: str = "",
+            efError: str = "",
+            efResults: list = [];
 
         # ---- Single-hop handlers ----
         async def handleBenchSingleHop -> None {
@@ -613,6 +773,33 @@ cl {
             mhLoading = False;
         }
 
+        # ---- Edge filter handler ----
+        async def handleBenchEdgeFilter -> None {
+            efLoading = True;
+            efStatus = "Running...";
+            efError = "";
+            try {
+                resp = root spawn bench_edge_filter(
+                    n_follow_post=efFollowPost,
+                    n_follow_other=efFollowOther,
+                    n_like_post=efLikePost,
+                    iterations=efIters
+                );
+                r = resp.reports[0];
+                efResults = efResults + [r];
+                efStatus = (
+                    f"Edge-only: OFF {r['edge_off_ms']} ms | ON warm {r['edge_warm_ms']} ms | "
+                    f"{r['edge_speedup_warm']}×   ·   "
+                    f"Combined: OFF {r['comb_off_ms']} ms | ON warm {r['comb_warm_ms']} ms | "
+                    f"{r['comb_speedup_warm']}×"
+                );
+            } except Exception as e {
+                efError = str(e);
+                efStatus = "";
+            }
+            efLoading = False;
+        }
+
         # ---- Clear handler ----
         async def handleClear -> None {
             try {
@@ -622,6 +809,7 @@ cl {
                 showHeatmap = False;
                 inhResults = [];
                 mhResults = [];
+                efResults = [];
                 shStatus = "Cleared.";
             } except Exception as e {
                 shError = str(e);
@@ -787,12 +975,12 @@ cl {
                         <div style={{"textAlign": "center"}}>
                             <div style={{"fontSize": "10px", "color": "#64748b", "textTransform": "uppercase", "fontWeight": "600", "marginBottom": "3px"}}>Avg warm speedup</div>
                             <div style={{"fontSize": "22px", "fontWeight": "800", "color": cellCol(avg_warm)}}>{avg_warm}×</div>
-                            <div style={{"fontSize": "9px", "color": "#94a3b8"}}>steady-state (AM hit)</div>
+                            <div style={{"fontSize": "9px", "color": "#94a3b8"}}>steady-state (SAM hit)</div>
                         </div>
                         <div style={{"textAlign": "center"}}>
                             <div style={{"fontSize": "10px", "color": "#64748b", "textTransform": "uppercase", "fontWeight": "600", "marginBottom": "3px"}}>Avg cold speedup</div>
                             <div style={{"fontSize": "22px", "fontWeight": "800", "color": cellCol(avg_cold)}}>{avg_cold}×</div>
-                            <div style={{"fontSize": "9px", "color": "#94a3b8"}}>AM-miss path (GT SQL)</div>
+                            <div style={{"fontSize": "9px", "color": "#94a3b8"}}>SAM-miss path (GTI SQL)</div>
                         </div>
                         <div style={{"textAlign": "center"}}>
                             <div style={{"fontSize": "10px", "color": "#64748b", "textTransform": "uppercase", "fontWeight": "600", "marginBottom": "3px"}}>Best warm</div>
@@ -858,7 +1046,8 @@ cl {
                 <div style={{"background": "#fff", "borderBottom": "1px solid #e2e8f0", "paddingLeft": "32px", "display": "flex", "alignItems": "center"}}>
                     <button style={tabStyle(activeTab == "singlehop")}  onClick={lambda _: Any -> None { activeTab = "singlehop";}}>Single-hop</button>
                     <button style={tabStyle(activeTab == "inheritance")} onClick={lambda _: Any -> None { activeTab = "inheritance";}}>Inheritance</button>
-                    <button style={tabStyle(activeTab == "multihop")}   onClick={lambda _: Any -> None { activeTab = "multihop";}}>Multi-hop</button>
+                    <button style={tabStyle(activeTab == "multihop")}    onClick={lambda _: Any -> None { activeTab = "multihop";}}>Multi-hop</button>
+                    <button style={tabStyle(activeTab == "edgefilter")}  onClick={lambda _: Any -> None { activeTab = "edgefilter";}}>Edge Filter</button>
                     <button
                         onClick={handleClear}
                         style={{"marginLeft": "auto", "marginRight": "24px", "padding": "7px 14px", "background": "#ef4444", "color": "#fff", "border": "none", "borderRadius": "6px", "cursor": "pointer", "fontSize": "13px"}}
@@ -873,13 +1062,13 @@ cl {
                                 <h2 style={{"margin": "0 0 4px 0", "fontSize": "15px", "fontWeight": "700", "color": "#1e293b"}}>Single-hop</h2>
                                 <p style={{"margin": "0 0 18px 0", "fontSize": "12px", "color": "#64748b"}}>
                                     Graph: BenchRoot → [TargetNode | OtherNode].
-                                    Query: <code>[bench--&gt;(?:TargetNode)]</code>
+                                    Query: <code>[bench-->(?:TargetNode)]</code>
                                 </p>
 
                                 <div style={{"background": "#f0f9ff", "border": "1px solid #bae6fd", "borderRadius": "6px", "padding": "12px 14px", "marginBottom": "18px", "fontSize": "12px", "color": "#0369a1", "lineHeight": "2.0"}}>
                                     <div><span style={{"background": "#8b5cf6", "color": "#fff", "borderRadius": "4px", "padding": "1px 7px", "fontWeight": "700", "marginRight": "6px"}}>OFF</span> <code>JAC_INDEX_ENABLED=false</code> — walks the full edge list, loads all {fanOut} neighbor stubs from SQLite, then filters in Python. Cost scales with total fan-out regardless of selectivity.</div>
-                                    <div><span style={{"background": "#f59e0b", "color": "#fff", "borderRadius": "4px", "padding": "1px 7px", "fontWeight": "700", "marginRight": "6px"}}>ON cold</span> AM dict evicted before each iteration — AM miss triggers 1 GT SQL <code>SELECT WHERE type=TargetNode</code>, result warms AM. Avg of N−1 cold runs (first discarded). Higher overhead than OFF when fan-out is moderate and the SQL query cost dominates the savings.</div>
-                                    <div><span style={{"background": "#10b981", "color": "#fff", "borderRadius": "4px", "padding": "1px 7px", "fontWeight": "700", "marginRight": "6px"}}>ON warm</span> AM already populated — direct dict lookup returns {int(fanOut * selectivity)} matching IDs, then bulk-fetch only those nodes. L1 cleared each iteration so node fetches still go to SQLite. <strong>This is the steady-state server path.</strong></div>
+                                    <div><span style={{"background": "#f59e0b", "color": "#fff", "borderRadius": "4px", "padding": "1px 7px", "fontWeight": "700", "marginRight": "6px"}}>ON cold</span> SAM evicted before each iteration — SAM miss triggers 1 GTI SQL <code>SELECT WHERE type=TargetNode</code>, result warms SAM. Avg of N−1 cold runs (first discarded). Higher overhead than OFF when fan-out is moderate and the SQL query cost dominates the savings.</div>
+                                    <div><span style={{"background": "#10b981", "color": "#fff", "borderRadius": "4px", "padding": "1px 7px", "fontWeight": "700", "marginRight": "6px"}}>ON warm</span> SAM already populated — direct dict lookup returns {int(fanOut * selectivity)} matching IDs, then bulk-fetch only those nodes. L1 cleared each iteration so node fetches still go to SQLite. <strong>This is the steady-state server path.</strong></div>
                                 </div>
 
                                 <div style={{"display": "flex", "gap": "24px", "flexWrap": "wrap", "alignItems": "flex-end"}}>
@@ -934,16 +1123,16 @@ cl {
                                                 {interpBadge({"sp": r["speedup_warm"] or 0.0})}
                                                 {(r["cold_stats"] and
                                                     <span style={{"display": "flex", "gap": "4px", "marginLeft": "4px"}}>
-                                                        {statsPill({"label": "AM hits",   "val": r["cold_stats"]["am_hits"]   or 0, "color": "#0d9488"})}
-                                                        {statsPill({"label": "AM misses", "val": r["cold_stats"]["am_misses"] or 0, "color": "#f59e0b"})}
-                                                        {statsPill({"label": "GT hits",   "val": r["cold_stats"]["gt_hits"]   or 0, "color": "#0369a1"})}
+                                                        {statsPill({"label": "SAM hits",   "val": r["cold_stats"]["sam_hits"]   or 0, "color": "#0d9488"})}
+                                                        {statsPill({"label": "SAM misses", "val": r["cold_stats"]["sam_misses"] or 0, "color": "#f59e0b"})}
+                                                        {statsPill({"label": "GTI hits",   "val": r["cold_stats"]["gti_hits"]   or 0, "color": "#0369a1"})}
                                                     </span>
                                                 )}
                                             </div>
                                             <div style={{"fontSize": "10px", "color": "#94a3b8", "marginBottom": "8px", "lineHeight": "1.6"}}>
                                                 <span style={{"color": "#8b5cf6", "fontWeight": "600"}}>OFF</span>: loads all {r["fan_out"] or "?"} neighbors → filter {r["n_results"] or "?"} in Python &nbsp;·&nbsp;
-                                                <span style={{"color": "#f59e0b", "fontWeight": "600"}}>ON cold</span>: AM miss → 1 GT SQL query ({r["cold_stats"]["gt_hits"] or 0 if r["cold_stats"] else 0} GT hit(s)) → warms AM &nbsp;·&nbsp;
-                                                <span style={{"color": "#10b981", "fontWeight": "600"}}>ON warm</span>: AM dict hit → fetch only {r["n_results"] or "?"} matching nodes (skips {(r["fan_out"] or 0) - (r["n_results"] or 0)} unnecessary loads)
+                                                <span style={{"color": "#f59e0b", "fontWeight": "600"}}>ON cold</span>: SAM miss → 1 GTI SQL query ({r["cold_stats"]["gti_hits"] or 0 if r["cold_stats"] else 0} GTI hit(s)) → warms SAM &nbsp;·&nbsp;
+                                                <span style={{"color": "#10b981", "fontWeight": "600"}}>ON warm</span>: SAM hit → fetch only {r["n_results"] or "?"} matching nodes (skips {(r["fan_out"] or 0) - (r["n_results"] or 0)} unnecessary loads)
                                             </div>
                                             {barRow({"label": "OFF",     "color": "#8b5cf6", "val": r["off_avg_ms"],     "maxVal": max(r["off_avg_ms"], r["on_cold_ms"], r["on_warm_avg_ms"])})}
                                             {barRow({"label": "ON cold", "color": "#f59e0b", "val": r["on_cold_ms"],     "maxVal": max(r["off_avg_ms"], r["on_cold_ms"], r["on_warm_avg_ms"])})}
@@ -1022,14 +1211,14 @@ cl {
                                 <h2 style={{"margin": "0 0 4px 0", "fontSize": "15px", "fontWeight": "700", "color": "#1e293b"}}>Inheritance (MRO fan-out)</h2>
                                 <p style={{"margin": "0 0 18px 0", "fontSize": "12px", "color": "#64748b"}}>
                                     Graph: BenchRoot → [PostNode | CommentNode | OtherNode].
-                                    Query: <code>[bench--&gt;(?:BaseContent)]</code> — returns PostNode + CommentNode via MRO.
-                                    At <code>++&gt;</code> time, am_put indexes each node under every ancestor type, so "BaseContent" bucket already contains both subtypes.
+                                    Query: <code>[bench-->(?:BaseContent)]</code> — returns PostNode + CommentNode via MRO.
+                                    At <code>++></code> time, am_put indexes each node under every ancestor type, so "BaseContent" bucket already contains both subtypes.
                                 </p>
 
                                 <div style={{"background": "#f0fdf4", "border": "1px solid #bbf7d0", "borderRadius": "6px", "padding": "12px 14px", "marginBottom": "18px", "fontSize": "12px", "color": "#065f46", "lineHeight": "2.0"}}>
                                     <div><span style={{"background": "#8b5cf6", "color": "#fff", "borderRadius": "4px", "padding": "1px 7px", "fontWeight": "700", "marginRight": "6px"}}>OFF</span> Loads all {inhFanOut} neighbors, then filters with <code>isinstance(node, BaseContent)</code> in Python — pays for every OtherNode fetch even though they're discarded.</div>
-                                    <div><span style={{"background": "#f59e0b", "color": "#fff", "borderRadius": "4px", "padding": "1px 7px", "fontWeight": "700", "marginRight": "6px"}}>ON cold</span> AM evicted → 1 GT SQL query on "BaseContent" bucket (resolves PostNode + CommentNode IDs via MRO fan-out at <code>++&gt;</code> time). Avg of N−1 cold runs.</div>
-                                    <div><span style={{"background": "#10b981", "color": "#fff", "borderRadius": "4px", "padding": "1px 7px", "fontWeight": "700", "marginRight": "6px"}}>ON warm</span> "BaseContent" AM dict hit → fetch only {int(inhFanOut * inhSel)} matching nodes (Post + Comment). OtherNodes never loaded. <strong>MRO fan-out is the key advantage here.</strong></div>
+                                    <div><span style={{"background": "#f59e0b", "color": "#fff", "borderRadius": "4px", "padding": "1px 7px", "fontWeight": "700", "marginRight": "6px"}}>ON cold</span> SAM evicted → 1 GTI SQL query on "BaseContent" bucket (resolves PostNode + CommentNode IDs via MRO fan-out at <code>++></code> time). Avg of N−1 cold runs.</div>
+                                    <div><span style={{"background": "#10b981", "color": "#fff", "borderRadius": "4px", "padding": "1px 7px", "fontWeight": "700", "marginRight": "6px"}}>ON warm</span> "BaseContent" SAM hit → fetch only {int(inhFanOut * inhSel)} matching nodes (Post + Comment). OtherNodes never loaded. <strong>MRO fan-out is the key advantage here.</strong></div>
                                 </div>
 
                                 <div style={{"display": "flex", "gap": "24px", "flexWrap": "wrap", "alignItems": "flex-end"}}>
@@ -1078,16 +1267,16 @@ cl {
                                                 {interpBadge({"sp": r["speedup_warm"] or 0.0})}
                                                 {(r["cold_stats"] and
                                                     <span style={{"display": "flex", "gap": "4px", "marginLeft": "4px"}}>
-                                                        {statsPill({"label": "AM hits",   "val": r["cold_stats"]["am_hits"]   or 0, "color": "#0d9488"})}
-                                                        {statsPill({"label": "AM misses", "val": r["cold_stats"]["am_misses"] or 0, "color": "#f59e0b"})}
-                                                        {statsPill({"label": "GT hits",   "val": r["cold_stats"]["gt_hits"]   or 0, "color": "#0369a1"})}
+                                                        {statsPill({"label": "SAM hits",   "val": r["cold_stats"]["sam_hits"]   or 0, "color": "#0d9488"})}
+                                                        {statsPill({"label": "SAM misses", "val": r["cold_stats"]["sam_misses"] or 0, "color": "#f59e0b"})}
+                                                        {statsPill({"label": "GTI hits",   "val": r["cold_stats"]["gti_hits"]   or 0, "color": "#0369a1"})}
                                                     </span>
                                                 )}
                                             </div>
                                             <div style={{"fontSize": "10px", "color": "#94a3b8", "marginBottom": "8px", "lineHeight": "1.6"}}>
                                                 <span style={{"color": "#8b5cf6", "fontWeight": "600"}}>OFF</span>: fetches all {r["fan_out"] or "?"} nodes including OtherNodes, filters by isinstance(BaseContent) &nbsp;·&nbsp;
-                                                <span style={{"color": "#f59e0b", "fontWeight": "600"}}>ON cold</span>: 1 GT SQL on "BaseContent" bucket (MRO-indexed at edge-creation time) &nbsp;·&nbsp;
-                                                <span style={{"color": "#10b981", "fontWeight": "600"}}>ON warm</span>: AM hit → {r["n_results"] or "?"} fetches only (skips {(r["fan_out"] or 0) - (r["n_results"] or 0)} OtherNode loads)
+                                                <span style={{"color": "#f59e0b", "fontWeight": "600"}}>ON cold</span>: 1 GTI SQL on "BaseContent" bucket (MRO-indexed at edge-creation time) &nbsp;·&nbsp;
+                                                <span style={{"color": "#10b981", "fontWeight": "600"}}>ON warm</span>: SAM hit → {r["n_results"] or "?"} fetches only (skips {(r["fan_out"] or 0) - (r["n_results"] or 0)} OtherNode loads)
                                             </div>
                                             {barRow({"label": "OFF",     "color": "#8b5cf6", "val": r["off_avg_ms"],     "maxVal": max(r["off_avg_ms"], r["on_cold_ms"], r["on_warm_avg_ms"])})}
                                             {barRow({"label": "ON cold", "color": "#f59e0b", "val": r["on_cold_ms"],     "maxVal": max(r["off_avg_ms"], r["on_cold_ms"], r["on_warm_avg_ms"])})}
@@ -1111,7 +1300,7 @@ cl {
                                 <h2 style={{"margin": "0 0 4px 0", "fontSize": "15px", "fontWeight": "700", "color": "#1e293b"}}>Multi-hop (2-hop)</h2>
                                 <p style={{"margin": "0 0 18px 0", "fontSize": "12px", "color": "#64748b"}}>
                                     Graph: BenchRoot → MidNode[i] → [TargetNode | OtherNode].
-                                    Query: <code>[bench--&gt;(?:MidNode)]</code> then <code>[mid--&gt;(?:TargetNode)]</code> for each mid.
+                                    Query: <code>[bench-->(?:MidNode)]</code> then <code>[mid-->(?:TargetNode)]</code> for each mid.
                                     OFF cost: {mhMid} mid fetches + {mhMid}×{mhBt+mhBo} child fetches.
                                     ON warm cost: index resolves mid IDs + {mhMid}×{mhBt} target fetches only.
                                 </p>
@@ -1167,16 +1356,16 @@ cl {
                                                 {interpBadge({"sp": r["speedup_warm"] or 0.0})}
                                                 {(r["cold_stats"] and
                                                     <span style={{"display": "flex", "gap": "4px", "marginLeft": "4px"}}>
-                                                        {statsPill({"label": "AM hits",   "val": r["cold_stats"]["am_hits"]   or 0, "color": "#0d9488"})}
-                                                        {statsPill({"label": "AM misses", "val": r["cold_stats"]["am_misses"] or 0, "color": "#f59e0b"})}
-                                                        {statsPill({"label": "GT hits",   "val": r["cold_stats"]["gt_hits"]   or 0, "color": "#0369a1"})}
+                                                        {statsPill({"label": "SAM hits",   "val": r["cold_stats"]["sam_hits"]   or 0, "color": "#0d9488"})}
+                                                        {statsPill({"label": "SAM misses", "val": r["cold_stats"]["sam_misses"] or 0, "color": "#f59e0b"})}
+                                                        {statsPill({"label": "GTI hits",   "val": r["cold_stats"]["gti_hits"]   or 0, "color": "#0369a1"})}
                                                     </span>
                                                 )}
                                             </div>
                                             <div style={{"fontSize": "10px", "color": "#94a3b8", "marginBottom": "8px", "lineHeight": "1.6"}}>
                                                 <span style={{"color": "#8b5cf6", "fontWeight": "600"}}>OFF</span>: hop1 loads {r["n_mid"] or "?"} MidNodes + hop2 loads all {r["branch_factor"] or "?"} children per mid ({(r["n_mid"] or 0) * (r["branch_factor"] or 0)} total loads), filters in Python &nbsp;·&nbsp;
-                                                <span style={{"color": "#f59e0b", "fontWeight": "600"}}>ON cold</span>: {r["cold_stats"]["am_misses"] or 0 if r["cold_stats"] else 0} AM miss(es) → {r["cold_stats"]["gt_hits"] or 0 if r["cold_stats"] else 0} GT SQL queries (1 per source node) &nbsp;·&nbsp;
-                                                <span style={{"color": "#10b981", "fontWeight": "600"}}>ON warm</span>: index resolves each hop in AM → {r["n_results"] or "?"} target fetches only (avoids {(r["n_mid"] or 0) * ((r["branch_factor"] or 0) - int((r["selectivity"] or 0) * (r["branch_factor"] or 0)))} unnecessary loads)
+                                                <span style={{"color": "#f59e0b", "fontWeight": "600"}}>ON cold</span>: {r["cold_stats"]["sam_misses"] or 0 if r["cold_stats"] else 0} SAM miss(es) → {r["cold_stats"]["gti_hits"] or 0 if r["cold_stats"] else 0} GTI SQL queries (1 per source node) &nbsp;·&nbsp;
+                                                <span style={{"color": "#10b981", "fontWeight": "600"}}>ON warm</span>: index resolves each hop in SAM → {r["n_results"] or "?"} target fetches only (avoids {(r["n_mid"] or 0) * ((r["branch_factor"] or 0) - int((r["selectivity"] or 0) * (r["branch_factor"] or 0)))} unnecessary loads)
                                             </div>
                                             {barRow({"label": "OFF",     "color": "#8b5cf6", "val": r["off_avg_ms"],     "maxVal": max(r["off_avg_ms"], r["on_cold_ms"], r["on_warm_avg_ms"])})}
                                             {barRow({"label": "ON cold", "color": "#f59e0b", "val": r["on_cold_ms"],     "maxVal": max(r["off_avg_ms"], r["on_cold_ms"], r["on_warm_avg_ms"])})}
@@ -1189,6 +1378,133 @@ cl {
                                     ]}
                                     {resultsTable({"rows": mhResults})}
                                     {summaryPanel({"rows": mhResults, "group_key": "n_mid"})}
+                                </div>
+                            )}
+                        </div>
+                    )}
+
+                    {(activeTab == "edgefilter" and
+                        <div>
+                            <div style={{"background": "#fff", "border": "1px solid #e2e8f0", "borderRadius": "10px", "padding": "22px", "marginBottom": "24px"}}>
+                                <h2 style={{"margin": "0 0 4px 0", "fontSize": "15px", "fontWeight": "700", "color": "#1e293b"}}>Edge-type Filter</h2>
+                                <p style={{"margin": "0 0 6px 0", "fontSize": "12px", "color": "#64748b"}}>
+                                    Graph: BenchRoot –[FollowEdge]→ [PostNode | OtherNode]  ·  BenchRoot –[LikeEdge]→ PostNode.
+                                    Two queries benchmarked per run:
+                                </p>
+                                <ul style={{"margin": "0 0 18px 0", "paddingLeft": "18px", "fontSize": "12px", "color": "#64748b", "lineHeight": "2.0"}}>
+                                    <li><code>[-[FollowEdge]->]</code> — edge-type filter only. SAM "e:FollowEdge" column. Matches FollowEdge targets regardless of node type.</li>
+                                    <li><code>[-[FollowEdge]->(?:PostNode)]</code> — combined filter. SAM intersection of "e:FollowEdge" ∩ "n:PostNode". Only nodes that are both FollowEdge targets AND PostNode.</li>
+                                </ul>
+
+                                <div style={{"background": "#faf5ff", "border": "1px solid #e9d5ff", "borderRadius": "6px", "padding": "12px 14px", "marginBottom": "18px", "fontSize": "12px", "color": "#6b21a8", "lineHeight": "2.0"}}>
+                                    <div><span style={{"background": "#8b5cf6", "color": "#fff", "borderRadius": "4px", "padding": "1px 7px", "fontWeight": "700", "marginRight": "6px"}}>OFF</span> Walks all edges, checks <code>isinstance(edge, FollowEdge)</code> and optionally <code>isinstance(node, PostNode)</code> in Python. Loads all {efFollowPost + efFollowOther + efLikePost} stubs regardless of match.</div>
+                                    <div><span style={{"background": "#f59e0b", "color": "#fff", "borderRadius": "4px", "padding": "1px 7px", "fontWeight": "700", "marginRight": "6px"}}>ON cold</span> SAM miss → 1 GTI SQL query per sub-query. Edge-only: <code>WHERE edge_type='FollowEdge'</code>. Combined: two queries (node + edge columns), then Python set intersection. Warms SAM "e:" and "n:" columns separately.</div>
+                                    <div><span style={{"background": "#10b981", "color": "#fff", "borderRadius": "4px", "padding": "1px 7px", "fontWeight": "700", "marginRight": "6px"}}>ON warm</span> SAM hit: edge-only → O(1) dict lookup of "e:FollowEdge". Combined → O(min(a,b)) set intersection in memory. Fetches only matching node anchors.</div>
+                                </div>
+
+                                <div style={{"display": "flex", "gap": "24px", "flexWrap": "wrap", "alignItems": "flex-end"}}>
+                                    <div>
+                                        <label style={labelStyle}>FollowEdge → PostNode</label>
+                                        <select value={efFollowPost} onChange={lambda e: Any -> None { efFollowPost = int(e.target.value);}} style={selectStyle}>
+                                            <option value={10}>10</option>
+                                            <option value={20}>20</option>
+                                            <option value={50}>50</option>
+                                            <option value={100}>100</option>
+                                        </select>
+                                    </div>
+                                    <div>
+                                        <label style={labelStyle}>FollowEdge → OtherNode</label>
+                                        <select value={efFollowOther} onChange={lambda e: Any -> None { efFollowOther = int(e.target.value);}} style={selectStyle}>
+                                            <option value={10}>10</option>
+                                            <option value={30}>30</option>
+                                            <option value={80}>80</option>
+                                            <option value={200}>200</option>
+                                        </select>
+                                    </div>
+                                    <div>
+                                        <label style={labelStyle}>LikeEdge → PostNode</label>
+                                        <select value={efLikePost} onChange={lambda e: Any -> None { efLikePost = int(e.target.value);}} style={selectStyle}>
+                                            <option value={20}>20</option>
+                                            <option value={50}>50</option>
+                                            <option value={100}>100</option>
+                                            <option value={200}>200</option>
+                                        </select>
+                                    </div>
+                                    <div>
+                                        <label style={labelStyle}>Iterations</label>
+                                        <select value={efIters} onChange={lambda e: Any -> None { efIters = int(e.target.value);}} style={selectStyle}>
+                                            <option value={1}>1</option>
+                                            <option value={5}>5</option>
+                                            <option value={10}>10</option>
+                                        </select>
+                                    </div>
+                                    <button onClick={handleBenchEdgeFilter} disabled={efLoading} style={btnStyle("#7c3aed")}>
+                                        {("Running..." if efLoading else "Run Benchmark")}
+                                    </button>
+                                </div>
+                                {(efStatus and <p style={{"margin": "14px 0 0 0", "color": "#0f766e", "fontSize": "13px"}}>{efStatus}</p>)}
+                                {(efError  and <p style={{"margin": "14px 0 0 0", "color": "#dc2626", "fontSize": "13px"}}>Error: {efError}</p>)}
+                            </div>
+
+                            {(len(efResults) > 0 and
+                                <div style={{"background": "#fff", "border": "1px solid #e2e8f0", "borderRadius": "10px", "padding": "22px"}}>
+                                    <h2 style={{"margin": "0 0 18px 0", "fontSize": "15px", "fontWeight": "700"}}>Results</h2>
+                                    {[
+                                        <div key={i} style={{"marginBottom": "28px", "paddingBottom": "20px", "borderBottom": "1px solid #f1f5f9"}}>
+                                            <div style={{"fontSize": "12px", "color": "#374151", "fontWeight": "700", "marginBottom": "10px"}}>
+                                                {f"fan={r['fan_out']}  follow={r['n_follow']}  combined_match={r['n_combined']}  iter={r['iterations']}"}
+                                            </div>
+
+                                            <div style={{"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "16px"}}>
+
+                                                <div style={{"background": "#f5f3ff", "borderRadius": "8px", "padding": "14px"}}>
+                                                    <div style={{"fontSize": "11px", "fontWeight": "700", "color": "#6b21a8", "marginBottom": "6px", "textTransform": "uppercase", "letterSpacing": "0.05em"}}>
+                                                        [-[FollowEdge]-&gt;]  (edge-type only)
+                                                    </div>
+                                                    <div style={{"fontSize": "10px", "color": "#94a3b8", "marginBottom": "8px"}}>
+                                                        {f"Matches {r['n_follow']} of {r['fan_out']} — skips {r['fan_out'] - r['n_follow']} LikeEdge targets"}
+                                                    </div>
+                                                    {barRow({"label": "OFF",     "color": "#8b5cf6", "val": r["edge_off_ms"],  "maxVal": max(r["edge_off_ms"], r["edge_cold_ms"], r["edge_warm_ms"])})}
+                                                    {barRow({"label": "ON cold", "color": "#f59e0b", "val": r["edge_cold_ms"], "maxVal": max(r["edge_off_ms"], r["edge_cold_ms"], r["edge_warm_ms"])})}
+                                                    {barRow({"label": "ON warm", "color": "#10b981", "val": r["edge_warm_ms"], "maxVal": max(r["edge_off_ms"], r["edge_cold_ms"], r["edge_warm_ms"])})}
+                                                    <div style={{"display": "flex", "alignItems": "center", "gap": "8px", "marginTop": "8px"}}>
+                                                        {interpBadge({"sp": r["edge_speedup_warm"] or 0.0})}
+                                                        {(r["edge_cold_stats"] and
+                                                            <span style={{"display": "flex", "gap": "4px"}}>
+                                                                {statsPill({"label": "SAM hits",   "val": r["edge_cold_stats"]["sam_hits"]   or 0, "color": "#0d9488"})}
+                                                                {statsPill({"label": "SAM misses", "val": r["edge_cold_stats"]["sam_misses"] or 0, "color": "#f59e0b"})}
+                                                                {statsPill({"label": "GTI hits",   "val": r["edge_cold_stats"]["gti_hits"]   or 0, "color": "#0369a1"})}
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                </div>
+
+                                                <div style={{"background": "#ecfdf5", "borderRadius": "8px", "padding": "14px"}}>
+                                                    <div style={{"fontSize": "11px", "fontWeight": "700", "color": "#065f46", "marginBottom": "6px", "textTransform": "uppercase", "letterSpacing": "0.05em"}}>
+                                                        [-[FollowEdge]-&gt;(?:PostNode)]  (combined)
+                                                    </div>
+                                                    <div style={{"fontSize": "10px", "color": "#94a3b8", "marginBottom": "8px"}}>
+                                                        {f"Matches {r['n_combined']} of {r['fan_out']} — intersect(e:FollowEdge ∩ n:PostNode)"}
+                                                    </div>
+                                                    {barRow({"label": "OFF",     "color": "#8b5cf6", "val": r["comb_off_ms"],  "maxVal": max(r["comb_off_ms"], r["comb_cold_ms"], r["comb_warm_ms"])})}
+                                                    {barRow({"label": "ON cold", "color": "#f59e0b", "val": r["comb_cold_ms"], "maxVal": max(r["comb_off_ms"], r["comb_cold_ms"], r["comb_warm_ms"])})}
+                                                    {barRow({"label": "ON warm", "color": "#10b981", "val": r["comb_warm_ms"], "maxVal": max(r["comb_off_ms"], r["comb_cold_ms"], r["comb_warm_ms"])})}
+                                                    <div style={{"display": "flex", "alignItems": "center", "gap": "8px", "marginTop": "8px"}}>
+                                                        {interpBadge({"sp": r["comb_speedup_warm"] or 0.0})}
+                                                        {(r["comb_cold_stats"] and
+                                                            <span style={{"display": "flex", "gap": "4px"}}>
+                                                                {statsPill({"label": "SAM hits",   "val": r["comb_cold_stats"]["sam_hits"]   or 0, "color": "#0d9488"})}
+                                                                {statsPill({"label": "SAM misses", "val": r["comb_cold_stats"]["sam_misses"] or 0, "color": "#f59e0b"})}
+                                                                {statsPill({"label": "GTI hits",   "val": r["comb_cold_stats"]["gti_hits"]   or 0, "color": "#0369a1"})}
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                </div>
+
+                                            </div>
+                                        </div>
+                                        for (i, r) in enumerate(efResults)
+                                    ]}
                                 </div>
                             )}
                         </div>
