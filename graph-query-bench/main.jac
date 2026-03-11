@@ -1075,6 +1075,88 @@ cl {
             }}>{text}</span>;
         }
 
+        # ---- Correctness badge: compact pass/fail pill ----
+        def correctnessBadge(c: dict) -> JsxElement {
+            all_ok = c["all_ok"];
+            bg  = "#d1fae5" if all_ok else "#fee2e2";
+            col = "#065f46" if all_ok else "#991b1b";
+            txt = "✓ correct" if all_ok else "✗ wrong";
+            return <span style={{
+                "display": "inline-block", "padding": "2px 8px", "borderRadius": "12px",
+                "background": bg, "color": col, "fontSize": "11px", "fontWeight": "700"
+            }}>{txt}</span>;
+        }
+
+        # ---- Single correctness row: label + ok/fail + expected/actual/missing/extra ----
+        # Takes a single dict with keys: label (str), chk (dict with ok/expected_count/…)
+        def correctnessRow(row: dict) -> JsxElement {
+            label   = row["label"];
+            chk     = row["chk"] or {};
+            ok      = chk["ok"] if chk else True;
+            ok_col  = "#065f46" if ok else "#dc2626";
+            ok_sym  = "✓" if ok else "✗";
+            miss_part  = f"  missing={chk['missing_count']}" if (chk and chk["missing_count"] > 0) else "";
+            extra_part = f"  extra={chk['extra_count']}"   if (chk and chk["extra_count"]   > 0) else "";
+            detail     = f"expected={chk['expected_count'] or 0}  got={chk['actual_count'] or 0}{miss_part}{extra_part}" if chk else "no data";
+            return
+                <div style={{"display": "flex", "gap": "8px", "alignItems": "center", "marginBottom": "2px"}}>
+                    <span style={{"width": "52px", "fontSize": "10px", "fontWeight": "600", "color": "#64748b"}}>{label}</span>
+                    <span style={{"color": ok_col, "fontWeight": "700", "fontSize": "12px"}}>{ok_sym}</span>
+                    <span style={{"fontSize": "10px", "color": "#64748b", "fontFamily": "monospace"}}>{detail}</span>
+                </div>;
+        }
+
+        # ---- Correctness panel for single-hop / inheritance / multi-hop ----
+        # Expects c with keys: all_ok, off, on_cold, on_warm
+        def correctnessPanel(c: dict) -> JsxElement {
+            all_ok     = c["all_ok"];
+            hdr_bg     = "#f0fdf4" if all_ok else "#fef2f2";
+            hdr_border = "#bbf7d0" if all_ok else "#fca5a5";
+            hdr_col    = "#065f46" if all_ok else "#dc2626";
+            hdr_text   = "✓ Correctness: PASS" if all_ok else "✗ Correctness: FAIL";
+            return
+                <div style={{"border": f"1px solid {hdr_border}", "background": hdr_bg, "borderRadius": "6px", "padding": "8px 12px", "marginTop": "8px"}}>
+                    <div style={{"fontWeight": "700", "marginBottom": "5px", "fontSize": "11px", "color": hdr_col}}>{hdr_text}</div>
+                    {correctnessRow({"label": "OFF",     "chk": c["off"]     or {}})}
+                    {correctnessRow({"label": "ON cold", "chk": c["on_cold"] or {}})}
+                    {correctnessRow({"label": "ON warm", "chk": c["on_warm"] or {}})}
+                </div>;
+        }
+
+        # ---- Correctness panel for edge-filter edge-only sub-query ----
+        # Expects c = full edge-filter correctness dict (keys: off_edge, cold_edge, warm_edge, …)
+        def correctnessPanelEdge(c: dict) -> JsxElement {
+            all_ok     = c["off_edge"]["ok"] and c["cold_edge"]["ok"] and c["warm_edge"]["ok"];
+            hdr_bg     = "#f0fdf4" if all_ok else "#fef2f2";
+            hdr_border = "#bbf7d0" if all_ok else "#fca5a5";
+            hdr_col    = "#065f46" if all_ok else "#dc2626";
+            hdr_text   = "✓ Correctness: PASS" if all_ok else "✗ Correctness: FAIL";
+            return
+                <div style={{"border": f"1px solid {hdr_border}", "background": hdr_bg, "borderRadius": "6px", "padding": "8px 12px", "marginTop": "8px"}}>
+                    <div style={{"fontWeight": "700", "marginBottom": "5px", "fontSize": "11px", "color": hdr_col}}>{hdr_text}</div>
+                    {correctnessRow({"label": "OFF",     "chk": c["off_edge"]  or {}})}
+                    {correctnessRow({"label": "ON cold", "chk": c["cold_edge"] or {}})}
+                    {correctnessRow({"label": "ON warm", "chk": c["warm_edge"] or {}})}
+                </div>;
+        }
+
+        # ---- Correctness panel for edge-filter combined sub-query ----
+        # Expects c = full edge-filter correctness dict (keys: off_comb, cold_comb, warm_comb, …)
+        def correctnessPanelComb(c: dict) -> JsxElement {
+            all_ok     = c["off_comb"]["ok"] and c["cold_comb"]["ok"] and c["warm_comb"]["ok"];
+            hdr_bg     = "#f0fdf4" if all_ok else "#fef2f2";
+            hdr_border = "#bbf7d0" if all_ok else "#fca5a5";
+            hdr_col    = "#065f46" if all_ok else "#dc2626";
+            hdr_text   = "✓ Correctness: PASS" if all_ok else "✗ Correctness: FAIL";
+            return
+                <div style={{"border": f"1px solid {hdr_border}", "background": hdr_bg, "borderRadius": "6px", "padding": "8px 12px", "marginTop": "8px"}}>
+                    <div style={{"fontWeight": "700", "marginBottom": "5px", "fontSize": "11px", "color": hdr_col}}>{hdr_text}</div>
+                    {correctnessRow({"label": "OFF",     "chk": c["off_comb"]})}
+                    {correctnessRow({"label": "ON cold", "chk": c["cold_comb"]})}
+                    {correctnessRow({"label": "ON warm", "chk": c["warm_comb"]})}
+                </div>;
+        }
+
         # ---- Aggregated summary panel: shown when > 1 run accumulated ----
         def summaryPanel(rows: list, group_key: str) -> JsxElement {
             if len(rows) < 2 { return <span/>; }
@@ -1269,6 +1351,7 @@ cl {
                                             <div style={{"display": "flex", "alignItems": "center", "flexWrap": "wrap", "gap": "6px", "marginBottom": "5px"}}>
                                                 <span style={{"fontSize": "12px", "color": "#374151", "fontWeight": "700"}}>{f"fan={r['fan_out'] or '?'}  sel={int((r['selectivity'] or 0)*100)}%  iter={r['iterations'] or '?'}  results={r['n_results'] or '?'}"}</span>
                                                 {interpBadge({"sp": r["speedup_warm"] or 0.0})}
+                                                {(r["correctness"] and correctnessBadge({"c": r["correctness"]}))}
                                                 {(r["cold_stats"] and
                                                     <span style={{"display": "flex", "gap": "4px", "marginLeft": "4px"}}>
                                                         {statsPill({"label": "SAM hits",   "val": r["cold_stats"]["sam_hits"]   or 0, "color": "#0d9488"})}
@@ -1288,6 +1371,7 @@ cl {
                                             <div style={{"marginTop": "6px", "fontSize": "11px", "color": "#64748b"}}>
                                                 {f"Warm {r['speedup_warm']}× · Cold {r['speedup_cold']}×  —  {'' if (r['speedup_warm'] or 0) >= 1.0 else 'index adds overhead at this fan/selectivity; '}{'index saves ' + str((r['fan_out'] or 0) - (r['n_results'] or 0)) + ' node fetches per warm query' if (r['speedup_warm'] or 0) >= 1.0 else ''}"}
                                             </div>
+                                            {(r["correctness"] and correctnessPanel({"c": r["correctness"]}))}
                                         </div>
                                         for (i, r) in enumerate(shResults)
                                     ]}
@@ -1413,6 +1497,7 @@ cl {
                                             <div style={{"display": "flex", "alignItems": "center", "flexWrap": "wrap", "gap": "6px", "marginBottom": "5px"}}>
                                                 <span style={{"fontSize": "12px", "color": "#374151", "fontWeight": "700"}}>{f"fan={r['fan_out'] or '?'}  BaseContent={int((r['selectivity'] or 0)*100)}%  results={r['n_results'] or '?'}"}</span>
                                                 {interpBadge({"sp": r["speedup_warm"] or 0.0})}
+                                                {(r["correctness"] and correctnessBadge({"c": r["correctness"]}))}
                                                 {(r["cold_stats"] and
                                                     <span style={{"display": "flex", "gap": "4px", "marginLeft": "4px"}}>
                                                         {statsPill({"label": "SAM hits",   "val": r["cold_stats"]["sam_hits"]   or 0, "color": "#0d9488"})}
@@ -1432,6 +1517,7 @@ cl {
                                             <div style={{"marginTop": "6px", "fontSize": "11px", "color": "#64748b"}}>
                                                 {f"Warm {r['speedup_warm']}× · Cold {r['speedup_cold']}×  —  MRO fan-out at ++> time is what makes the 'BaseContent' bucket work for both PostNode and CommentNode"}
                                             </div>
+                                            {(r["correctness"] and correctnessPanel({"c": r["correctness"]}))}
                                         </div>
                                         for (i, r) in enumerate(inhResults)
                                     ]}
@@ -1502,6 +1588,7 @@ cl {
                                             <div style={{"display": "flex", "alignItems": "center", "flexWrap": "wrap", "gap": "6px", "marginBottom": "5px"}}>
                                                 <span style={{"fontSize": "12px", "color": "#374151", "fontWeight": "700"}}>{f"mid={r['n_mid'] or '?'}  branch={r['branch_factor'] or '?'}  sel={int((r['selectivity'] or 0)*100)}%  results={r['n_results'] or '?'}"}</span>
                                                 {interpBadge({"sp": r["speedup_warm"] or 0.0})}
+                                                {(r["correctness"] and correctnessBadge({"c": r["correctness"]}))}
                                                 {(r["cold_stats"] and
                                                     <span style={{"display": "flex", "gap": "4px", "marginLeft": "4px"}}>
                                                         {statsPill({"label": "SAM hits",   "val": r["cold_stats"]["sam_hits"]   or 0, "color": "#0d9488"})}
@@ -1521,6 +1608,7 @@ cl {
                                             <div style={{"marginTop": "6px", "fontSize": "11px", "color": "#64748b"}}>
                                                 {f"Warm {r['speedup_warm']}× · Cold {r['speedup_cold']}×  —  cold overhead scales with n_mid ({r['n_mid'] or '?'} GT queries, one per hop-1 source node)"}
                                             </div>
+                                            {(r["correctness"] and correctnessPanel({"c": r["correctness"]}))}
                                         </div>
                                         for (i, r) in enumerate(mhResults)
                                     ]}
@@ -1599,8 +1687,11 @@ cl {
                                     <h2 style={{"margin": "0 0 18px 0", "fontSize": "15px", "fontWeight": "700"}}>Results</h2>
                                     {[
                                         <div key={i} style={{"marginBottom": "28px", "paddingBottom": "20px", "borderBottom": "1px solid #f1f5f9"}}>
-                                            <div style={{"fontSize": "12px", "color": "#374151", "fontWeight": "700", "marginBottom": "10px"}}>
-                                                {f"fan={r['fan_out']}  follow={r['n_follow']}  combined_match={r['n_combined']}  iter={r['iterations']}"}
+                                            <div style={{"display": "flex", "alignItems": "center", "gap": "8px", "marginBottom": "10px"}}>
+                                                <span style={{"fontSize": "12px", "color": "#374151", "fontWeight": "700"}}>
+                                                    {f"fan={r['fan_out']}  follow={r['n_follow']}  combined_match={r['n_combined']}  iter={r['iterations']}"}
+                                                </span>
+                                                {(r["correctness"] and correctnessBadge({"c": r["correctness"]}))}
                                             </div>
 
                                             <div style={{"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "16px"}}>
@@ -1625,6 +1716,7 @@ cl {
                                                             </span>
                                                         )}
                                                     </div>
+                                                    {(r["correctness"] and correctnessPanelEdge({"c": r["correctness"]}))}
                                                 </div>
 
                                                 <div style={{"background": "#ecfdf5", "borderRadius": "8px", "padding": "14px"}}>
@@ -1641,12 +1733,13 @@ cl {
                                                         {interpBadge({"sp": r["comb_speedup_warm"] or 0.0})}
                                                         {(r["comb_cold_stats"] and
                                                             <span style={{"display": "flex", "gap": "4px"}}>
-                                                                {statsPill({"label": "SAM hits",   "val": r["comb_cold_stats"]["sam_hits"]   or 0, "color": "#0d9488"})}
+                                                                {statsPill({"label": "SAM hits",   "val": r["comb_cold_stats"]["sam_hits"]   or 0, "color": "#0d9088"})}
                                                                 {statsPill({"label": "SAM misses", "val": r["comb_cold_stats"]["sam_misses"] or 0, "color": "#f59e0b"})}
                                                                 {statsPill({"label": "GTI hits",   "val": r["comb_cold_stats"]["gti_hits"]   or 0, "color": "#0369a1"})}
                                                             </span>
                                                         )}
                                                     </div>
+                                                    {(r["correctness"] and correctnessPanelComb({"c": r["correctness"]}))}
                                                 </div>
 
                                             </div>
