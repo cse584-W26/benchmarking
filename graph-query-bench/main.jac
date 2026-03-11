@@ -724,6 +724,25 @@ walker:pub run_all_scenarios {
                     on_warm_times.append((t1 - t0) * 1000.0);
                 }
 
+                # ---- Correctness checks (before cleanup) ----
+                os.environ["JAC_INDEX_ENABLED"] = "false";
+                ctx.mem.__mem__.clear();
+                off_results  = [bench-->(?:TargetNode)];
+                expected_ids = _ids(off_results);
+                off_correct  = {
+                    "ok":             len(off_results) == n_targets,
+                    "expected_count": n_targets,
+                    "actual_count":   len(off_results),
+                    "missing_count":  max(0, n_targets - len(off_results)),
+                    "extra_count":    max(0, len(off_results) - n_targets)
+                };
+                os.environ["JAC_INDEX_ENABLED"] = "true";
+                sam_clear();
+                ctx.mem.__mem__.clear();
+                cold_correct = _check(expected_ids, [bench-->(?:TargetNode)]);
+                ctx.mem.__mem__.clear();
+                warm_correct = _check(expected_ids, [bench-->(?:TargetNode)]);
+
                 # Cleanup
                 bench_id = bench.__jac__.id;
                 for child in [bench-->] { del child; }
@@ -747,7 +766,13 @@ walker:pub run_all_scenarios {
                     "on_warm_avg_ms": round(avg_warm, 3),
                     "speedup_cold":   sp_cold,
                     "speedup_warm":   sp_warm,
-                    "iterations":     self.iterations
+                    "iterations":     self.iterations,
+                    "correctness": {
+                        "off":     off_correct,
+                        "on_cold": cold_correct,
+                        "on_warm": warm_correct,
+                        "all_ok":  off_correct["ok"] and cold_correct["ok"] and warm_correct["ok"]
+                    }
                 };
                 all_results.append(result);
 
