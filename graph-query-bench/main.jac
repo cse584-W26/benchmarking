@@ -1088,16 +1088,14 @@ cl {
         }
 
         # ---- Single correctness row: label + ok/fail + expected/actual/missing/extra ----
-        # Takes a single dict with keys: label (str), chk (dict with ok/expected_count/…)
-        def correctnessRow(row: dict) -> JsxElement {
-            label   = row["label"];
-            chk     = row["chk"] or {};
-            ok      = chk["ok"] if chk else True;
-            ok_col  = "#065f46" if ok else "#dc2626";
-            ok_sym  = "✓" if ok else "✗";
-            miss_part  = f"  missing={chk['missing_count']}" if (chk and chk["missing_count"] > 0) else "";
-            extra_part = f"  extra={chk['extra_count']}"   if (chk and chk["extra_count"]   > 0) else "";
-            detail     = f"expected={chk['expected_count'] or 0}  got={chk['actual_count'] or 0}{miss_part}{extra_part}" if chk else "no data";
+        def correctnessRow(label: str, chk: dict) -> JsxElement {
+            chk_data   = chk or {};
+            ok         = chk_data["ok"] if chk_data else True;
+            ok_col     = "#065f46" if ok else "#dc2626";
+            ok_sym     = "✓" if ok else "✗";
+            miss_part  = f"  missing={chk_data['missing_count']}" if (chk_data and chk_data["missing_count"] > 0) else "";
+            extra_part = f"  extra={chk_data['extra_count']}"     if (chk_data and chk_data["extra_count"]   > 0) else "";
+            detail     = f"expected={chk_data['expected_count'] or 0}  got={chk_data['actual_count'] or 0}{miss_part}{extra_part}" if chk_data else "no data";
             return
                 <div style={{"display": "flex", "gap": "8px", "alignItems": "center", "marginBottom": "2px"}}>
                     <span style={{"width": "52px", "fontSize": "10px", "fontWeight": "600", "color": "#64748b"}}>{label}</span>
