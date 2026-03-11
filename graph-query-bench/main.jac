@@ -74,6 +74,28 @@ def _speedup(baseline: float, fast: float) -> float {
     return round(baseline / fast, 1) if fast > 0 else 0.0;
 }
 
+# Collect node IDs from a result list.
+def _ids(nodes: list) -> set {
+    s: set = set();
+    for n in nodes { s.add(n.__jac__.id); }
+    return s;
+}
+
+# Compare expected IDs (set) against a query result list.
+# Returns a dict with ok flag + counts of missing/extra nodes.
+def _check(expected: set, actual: list) -> dict {
+    actual_ids = _ids(actual);
+    missing    = len(expected - actual_ids);
+    extra      = len(actual_ids - expected);
+    return {
+        "ok":             missing == 0 and extra == 0,
+        "expected_count": len(expected),
+        "actual_count":   len(actual_ids),
+        "missing_count":  missing,
+        "extra_count":    extra
+    };
+}
+
 # ============================================================================
 # SCENARIO 1 — SINGLE-HOP
 # Graph:  BenchRoot → [TargetNode × n_targets | OtherNode × n_others]
@@ -112,6 +134,17 @@ walker:pub bench_single_hop {
             off_times.append((t1 - t0) * 1000.0);
         }
 
+        # ---- Correctness baseline: OFF results are the ground truth ----
+        # Verify the non-indexed full-scan returned exactly n_targets nodes.
+        expected_ids = _ids(off_results);
+        off_correct  = {
+            "ok":             len(off_results) == self.n_targets,
+            "expected_count": self.n_targets,
+            "actual_count":   len(off_results),
+            "missing_count":  max(0, self.n_targets - len(off_results)),
+            "extra_count":    max(0, len(off_results) - self.n_targets)
+        };
+
         # ---- ON cold path: SAM miss → GTI → warms SAM ----
         os.environ["JAC_INDEX_ENABLED"] = "true";
         cold_times: list = [];
@@ -127,6 +160,10 @@ walker:pub bench_single_hop {
         cold_stats  = dict(_stats);
         on_cold_ms  = _avg(cold_times[1:] if len(cold_times) > 1 else cold_times);
 
+        # Correctness: ON cold must return the same nodes as OFF.
+        ctx.mem.__mem__.clear();
+        cold_correct = _check(expected_ids, [bench-->(?:TargetNode)]);
+
         # ---- ON warm path: SAM hit ----
         on_warm_times: list = [];
         for _ in range(self.iterations) {
@@ -137,6 +174,10 @@ walker:pub bench_single_hop {
             t1 = perf_counter();
             on_warm_times.append((t1 - t0) * 1000.0);
         }
+
+        # Correctness: ON warm must return the same nodes as OFF.
+        ctx.mem.__mem__.clear();
+        warm_correct = _check(expected_ids, [bench-->(?:TargetNode)]);
 
         # ---- Cleanup: delete subgraph ----
         bench_id = bench.__jac__.id;
@@ -159,7 +200,13 @@ walker:pub bench_single_hop {
             "speedup_warm":   _speedup(avg_off, avg_warm),
             "n_results":      len(off_results),
             "cold_stats":     cold_stats,
-            "iterations":     self.iterations
+            "iterations":     self.iterations,
+            "correctness": {
+                "off":     off_correct,
+                "on_cold": cold_correct,
+                "on_warm": warm_correct,
+                "all_ok":  off_correct["ok"] and cold_correct["ok"] and warm_correct["ok"]
+            }
         };
     }
 }
@@ -206,6 +253,18 @@ walker:pub bench_inheritance {
             off_times.append((t1 - t0) * 1000.0);
         }
 
+        # ---- Correctness baseline: OFF results are the ground truth ----
+        # Expected: all PostNode + CommentNode instances (both inherit BaseContent).
+        n_expected   = self.n_post + self.n_comment;
+        expected_ids = _ids(off_results);
+        off_correct  = {
+            "ok":             len(off_results) == n_expected,
+            "expected_count": n_expected,
+            "actual_count":   len(off_results),
+            "missing_count":  max(0, n_expected - len(off_results)),
+            "extra_count":    max(0, len(off_results) - n_expected)
+        };
+
         # ---- ON cold path ----
         os.environ["JAC_INDEX_ENABLED"] = "true";
         cold_times: list = [];
@@ -221,6 +280,10 @@ walker:pub bench_inheritance {
         cold_stats = dict(_stats);
         on_cold_ms = _avg(cold_times[1:] if len(cold_times) > 1 else cold_times);
 
+        # Correctness: ON cold must return the same nodes as OFF.
+        ctx.mem.__mem__.clear();
+        cold_correct = _check(expected_ids, [bench-->(?:BaseContent)]);
+
         # ---- ON warm path ----
         on_warm_times: list = [];
         for _ in range(self.iterations) {
@@ -231,6 +294,10 @@ walker:pub bench_inheritance {
             t1 = perf_counter();
             on_warm_times.append((t1 - t0) * 1000.0);
         }
+
+        # Correctness: ON warm must return the same nodes as OFF.
+        ctx.mem.__mem__.clear();
+        warm_correct = _check(expected_ids, [bench-->(?:BaseContent)]);
 
         # ---- Cleanup ----
         bench_id = bench.__jac__.id;
@@ -253,7 +320,13 @@ walker:pub bench_inheritance {
             "speedup_warm":   _speedup(avg_off, avg_warm),
             "n_results":      len(off_results),
             "cold_stats":     cold_stats,
-            "iterations":     self.iterations
+            "iterations":     self.iterations,
+            "correctness": {
+                "off":     off_correct,
+                "on_cold": cold_correct,
+                "on_warm": warm_correct,
+                "all_ok":  off_correct["ok"] and cold_correct["ok"] and warm_correct["ok"]
+            }
         };
     }
 }
@@ -313,6 +386,18 @@ walker:pub bench_multihop {
             off_times.append((t1 - t0) * 1000.0);
         }
 
+        # ---- Correctness baseline: OFF results are the ground truth ----
+        # Expected: n_mid × n_bt TargetNodes across all branches.
+        n_expected   = self.n_mid * self.n_bt;
+        expected_ids = _ids(off_results);
+        off_correct  = {
+            "ok":             len(off_results) == n_expected,
+            "expected_count": n_expected,
+            "actual_count":   len(off_results),
+            "missing_count":  max(0, n_expected - len(off_results)),
+            "extra_count":    max(0, len(off_results) - n_expected)
+        };
+
         # ---- ON cold path ----
         os.environ["JAC_INDEX_ENABLED"] = "true";
         cold_times: list = [];
@@ -328,6 +413,10 @@ walker:pub bench_multihop {
         cold_stats = dict(_stats);
         on_cold_ms = _avg(cold_times[1:] if len(cold_times) > 1 else cold_times);
 
+        # Correctness: ON cold must return the same nodes as OFF.
+        ctx.mem.__mem__.clear();
+        cold_correct = _check(expected_ids, _run_2hop());
+
         # ---- ON warm path ----
         on_warm_times: list = [];
         for _ in range(self.iterations) {
@@ -338,6 +427,10 @@ walker:pub bench_multihop {
             t1 = perf_counter();
             on_warm_times.append((t1 - t0) * 1000.0);
         }
+
+        # Correctness: ON warm must return the same nodes as OFF.
+        ctx.mem.__mem__.clear();
+        warm_correct = _check(expected_ids, _run_2hop());
 
         # ---- Cleanup ----
         bench_id = bench.__jac__.id;
@@ -366,7 +459,13 @@ walker:pub bench_multihop {
             "speedup_warm":   _speedup(avg_off, avg_warm),
             "n_results":      len(off_results),
             "cold_stats":     cold_stats,
-            "iterations":     self.iterations
+            "iterations":     self.iterations,
+            "correctness": {
+                "off":     off_correct,
+                "on_cold": cold_correct,
+                "on_warm": warm_correct,
+                "all_ok":  off_correct["ok"] and cold_correct["ok"] and warm_correct["ok"]
+            }
         };
     }
 }
@@ -408,25 +507,45 @@ walker:pub bench_edge_filter {
         # ---- OFF: edge-only ----
         os.environ["JAC_INDEX_ENABLED"] = "false";
         off_edge_times: list = [];
+        off_edge_results: list = [];
         for _ in range(self.iterations) {
             bench.__jac__.edges = [e.make_stub() for e in bench.__jac__.edges];
             ctx.mem.__mem__.clear();
             t0 = perf_counter();
-            _run_edge();
+            off_edge_results = _run_edge();
             t1 = perf_counter();
             off_edge_times.append((t1 - t0) * 1000.0);
         }
 
         # ---- OFF: combined ----
         off_comb_times: list = [];
+        off_comb_results: list = [];
         for _ in range(self.iterations) {
             bench.__jac__.edges = [e.make_stub() for e in bench.__jac__.edges];
             ctx.mem.__mem__.clear();
             t0 = perf_counter();
-            _run_comb();
+            off_comb_results = _run_comb();
             t1 = perf_counter();
             off_comb_times.append((t1 - t0) * 1000.0);
         }
+
+        # ---- Correctness baseline: OFF results are the ground truth ----
+        expected_edge_ids = _ids(off_edge_results);
+        expected_comb_ids = _ids(off_comb_results);
+        off_edge_correct  = {
+            "ok":             len(off_edge_results) == n_edge,
+            "expected_count": n_edge,
+            "actual_count":   len(off_edge_results),
+            "missing_count":  max(0, n_edge - len(off_edge_results)),
+            "extra_count":    max(0, len(off_edge_results) - n_edge)
+        };
+        off_comb_correct  = {
+            "ok":             len(off_comb_results) == n_comb,
+            "expected_count": n_comb,
+            "actual_count":   len(off_comb_results),
+            "missing_count":  max(0, n_comb - len(off_comb_results)),
+            "extra_count":    max(0, len(off_comb_results) - n_comb)
+        };
 
         # ---- ON cold: edge-only ----
         os.environ["JAC_INDEX_ENABLED"] = "true";
@@ -442,6 +561,10 @@ walker:pub bench_edge_filter {
         }
         cold_edge_stats = dict(_stats);
 
+        # Correctness: ON cold edge-only must match OFF.
+        ctx.mem.__mem__.clear();
+        cold_edge_correct = _check(expected_edge_ids, _run_edge());
+
         # ---- ON cold: combined ----
         cold_comb_times: list = [];
         for _ in range(self.iterations) {
@@ -455,6 +578,10 @@ walker:pub bench_edge_filter {
         }
         cold_comb_stats = dict(_stats);
 
+        # Correctness: ON cold combined must match OFF.
+        ctx.mem.__mem__.clear();
+        cold_comb_correct = _check(expected_comb_ids, _run_comb());
+
         # ---- ON warm: edge-only (SAM already populated from cold runs) ----
         warm_edge_times: list = [];
         for _ in range(self.iterations) {
@@ -466,6 +593,10 @@ walker:pub bench_edge_filter {
             warm_edge_times.append((t1 - t0) * 1000.0);
         }
 
+        # Correctness: ON warm edge-only must match OFF.
+        ctx.mem.__mem__.clear();
+        warm_edge_correct = _check(expected_edge_ids, _run_edge());
+
         # ---- ON warm: combined ----
         warm_comb_times: list = [];
         for _ in range(self.iterations) {
@@ -476,6 +607,10 @@ walker:pub bench_edge_filter {
             t1 = perf_counter();
             warm_comb_times.append((t1 - t0) * 1000.0);
         }
+
+        # Correctness: ON warm combined must match OFF.
+        ctx.mem.__mem__.clear();
+        warm_comb_correct = _check(expected_comb_ids, _run_comb());
 
         # ---- Cleanup ----
         bench_id = bench.__jac__.id;
@@ -510,7 +645,20 @@ walker:pub bench_edge_filter {
             "comb_speedup_cold": _speedup(avg_off_comb, on_cold_comb),
             "comb_speedup_warm": _speedup(avg_off_comb, avg_warm_comb),
             "comb_cold_stats":  cold_comb_stats,
-            "iterations":       self.iterations
+            "iterations":       self.iterations,
+            "correctness": {
+                "off_edge":        off_edge_correct,
+                "off_comb":        off_comb_correct,
+                "cold_edge":       cold_edge_correct,
+                "cold_comb":       cold_comb_correct,
+                "warm_edge":       warm_edge_correct,
+                "warm_comb":       warm_comb_correct,
+                "all_ok": (
+                    off_edge_correct["ok"] and off_comb_correct["ok"] and
+                    cold_edge_correct["ok"] and cold_comb_correct["ok"] and
+                    warm_edge_correct["ok"] and warm_comb_correct["ok"]
+                )
+            }
         };
     }
 }
