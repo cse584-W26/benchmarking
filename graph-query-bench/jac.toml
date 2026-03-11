@@ -11,6 +11,10 @@ base_route_app = "app"
 
 [plugins.scale]
 
+[plugins.scale.kubernetes]
+jaseci_repo_url = "https://github.com/cse584-W26/jaseci.git"
+jaseci_branch = "scale_impl"
+
 [dependencies.npm]
 react-router-dom = "latest"
 react-error-boundary = "latest"
